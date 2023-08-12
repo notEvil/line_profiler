@@ -227,7 +227,7 @@ def main(args=None):
         # Run some setup code outside of the profiler. This is good for large
         # imports.
         setup_file = find_script(options.setup)
-        __file__ = setup_file
+        __file__ = setup_file if os.path.isabs(setup_file) else os.path.abspath(setup_file)
         __name__ = '__main__'
         # Make sure the script's directory is on sys.path instead of just
         # kernprof.py's.
@@ -245,7 +245,7 @@ def main(args=None):
         builtins.__dict__['profile'] = prof
 
     script_file = find_script(options.script)
-    __file__ = script_file
+    __file__ = script_file if os.path.isabs(script_file) else os.path.abspath(script_file)
     __name__ = '__main__'
     # Make sure the script's directory is on sys.path instead of just
     # kernprof.py's.
@@ -261,7 +261,7 @@ def main(args=None):
             execfile_ = execfile
             ns = locals()
             if options.builtin:
-                execfile(script_file, ns, ns)
+                execfile(__file__, ns, ns)
             else:
                 prof.runctx('execfile_(%r, globals())' % (script_file,), ns, ns)
         except (KeyboardInterrupt, SystemExit):
