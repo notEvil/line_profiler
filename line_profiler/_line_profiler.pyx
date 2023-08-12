@@ -430,7 +430,6 @@ PyObject *arg):
     cdef int64 code_hash
     cdef _Sub* sub
     cdef _Call* call
-    cdef LastTime old
 
     self = <LineProfiler>self_
 
@@ -498,25 +497,6 @@ PyObject *arg):
 
                 sub.time = hpTimer()
 
-            # original
-            if self._c_last_time[ident].count(block_hash):
-                old = self._c_last_time[ident][block_hash]
-                line_entries = self._c_code_map[code_hash]
-                key = old.f_lineno
-                if not line_entries.count(key):
-                    self._c_code_map[code_hash][key] = LineTime(code_hash, key, 0, 0)
-                self._c_code_map[code_hash][key].nhits += 1
-                self._c_code_map[code_hash][key].cumulative_time += time - old.time
-            if what == PyTrace_LINE:
-                # Get the time again. This way, we don't record much time wasted
-                # in this function.
-                self._c_last_time[ident][block_hash] = LastTime(get_line_number(py_frame), hpTimer())
-            elif self._c_last_time[ident].count(block_hash):
-                # We are returning from a function, not executing a line. Delete
-                # the last_time record. It may have already been deleted if we
-                # are profiling a generator that is being pumped past its end.
-                self._c_last_time[ident].erase(self._c_last_time[ident].find(block_hash))
-
     return 0
 
 
@@ -528,6 +508,8 @@ cdef _record_time(LineProfiler self, PY_LONG_LONG time, _Sub* sub):
             line_time.lineno = sub.line_number
         line_time.new_total_time += time - sub.time
         line_time.new_cumulative_time += time - sub.time + sub.sub_cumulative_time
+        line_time.cumulative_time = line_time.new_cumulative_time  # TODO
+        line_time.nhits = 1  # TODO
 
         sub.total_time += time - sub.time
         sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
