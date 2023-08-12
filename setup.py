@@ -219,17 +219,70 @@ if __name__ == '__main__':
         from Cython.Build import cythonize
 
         def run_cythonize(force=False):
+            DEFAULT_FLAGS = [
+                # LTO increases the build time by a bit
+                # but it results in decently faster code
+                "-flto",
+                # helps speed up stuff when including python
+                # by avoiding symbol collision
+                "-fno-semantic-interposition",
+                # speeds up compilation at the expense of using more memory
+                "-pipe",
+            ]
+
+            os.environ["CFLAGS"] = " ".join(DEFAULT_FLAGS)
+            # fix old macos builds
+            os.environ["CXXFLAGS"] = "-std=c++0x -stdlib=libc++"
+
             return cythonize(
-                Extension(
-                    name="line_profiler._line_profiler",
-                    sources=["line_profiler/_line_profiler.pyx", "line_profiler/timers.c", "line_profiler/unset_trace.c"],
-                    language="c++",
-                    define_macros=[("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))],
-                ),
-                compiler_directives={"language_level": 3, "infer_types": True, "linetrace": (True if os.getenv("DEV") == "true" else False)},
-                include_path=["line_profiler/python25.pxd"],
+                module_list=[
+                    Extension(
+                        name="cymem.cymem",
+                        sources=[
+                            "line_profiler/cymem/cymem/cymem.pyx",
+                        ],
+                        language="c++",
+                        define_macros=[
+                            ("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))
+                        ],
+                    ),
+                    Extension(
+                        name="preshed.maps",
+                        sources=[
+                            "line_profiler/preshed/preshed/maps.pyx",
+                        ],
+                        language="c++",
+                        define_macros=[
+                            ("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))
+                        ],
+                    ),
+                    Extension(
+                        name="line_profiler._line_profiler",
+                        sources=[
+                            "line_profiler/_line_profiler.pyx",
+                            "line_profiler/timers.cpp",
+                            "line_profiler/unset_trace.cpp",
+                        ],
+                        language="c++",
+                        define_macros=[
+                            ("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))
+                        ],
+                    ),
+                ],
+                compiler_directives={
+                    "language_level": 3,
+                    "infer_types": True,
+                    "linetrace": (True if os.getenv("DEV") == "true" else False),
+                },
+                include_path=[
+                    "line_profiler/python25.pxd",
+                    "line_profiler/",
+                    "line_profiler/cymem/",
+                    "line_profiler/preshed/",
+                ],
                 force=force,
                 nthreads=multiprocessing.cpu_count(),
+                annotate=True,
             )
 
         setupkw.update(dict(ext_modules=run_cythonize()))
