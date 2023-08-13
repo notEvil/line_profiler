@@ -5,6 +5,7 @@ cimport cython
 from cpython.version cimport PY_VERSION_HEX
 from libc.stdint cimport int64_t
 
+from libcpp cimport bool
 from libcpp.unordered_map cimport unordered_map
 from libcpp.vector cimport vector
 import threading
@@ -94,8 +95,7 @@ cdef struct LineTime:
     int64 code
     int lineno
     PY_LONG_LONG cumulative_time
-    PY_LONG_LONG new_total_time
-    PY_LONG_LONG new_cumulative_time
+    PY_LONG_LONG total_time
     long nhits
     
 cdef struct LastTime:
@@ -162,11 +162,46 @@ class LineStats(object):
     unit : float
         The number of seconds per timer unit.
     """
-    def __init__(self, timings, new_timings, new_call_stats, unit):
+    def __init__(self, timings, call_stats, unit):
         self.timings = timings
-        self.new_timings = new_timings
-        self.new_call_stats = new_call_stats
+        self.call_stats = call_stats
         self.unit = unit
+
+
+class Timing(tuple):
+    def __init__(self, line_number, hit_count, cumulative_time, total_time):
+        super().__init__()
+
+        self.line_number = line_number
+        self.hit_count = hit_count
+        self.cumulative_time = cumulative_time
+        self.total_time = total_time
+
+    # compatibility
+    def __new__(cls, line_number, hit_count, cumulative_time, *args, **kwargs):
+        return tuple.__new__(cls, (line_number, hit_count, cumulative_time))
+
+    def __reduce__(self):
+        return (Timing, (self.line_number, self.hit_count, self.cumulative_time, self.total_time))
+
+
+class CallStats:
+    def __init__(self, total_stats, cumulative_stats):
+        super().__init__()
+
+        self.total_stats = total_stats
+        self.cumulative_stats = cumulative_stats
+
+
+class TimeStats:
+    def __init__(self, sum_0, sum_1, sum_2, min, max):
+        super().__init__()
+
+        self.sum_0 = sum_0
+        self.sum_1 = sum_1
+        self.sum_2 = sum_2
+        self.min = min
+        self.max = max
 
 
 cdef struct _Sub:
@@ -175,6 +210,7 @@ cdef struct _Sub:
     vector[int64] code_hashes
     int line_number
     vector[int] line_numbers
+    bool hit
     PY_LONG_LONG total_time
     vector[PY_LONG_LONG] total_times
     PY_LONG_LONG cumulative_time
@@ -188,13 +224,13 @@ cdef struct _Call:
     PY_LONG_LONG total_s0
     PY_LONG_LONG total_s1
     double total_s2
-    PY_LONG_LONG total_min_time
-    PY_LONG_LONG total_max_time
+    PY_LONG_LONG total_min
+    PY_LONG_LONG total_max
     PY_LONG_LONG cumulative_s0
     PY_LONG_LONG cumulative_s1
     double cumulative_s2
-    PY_LONG_LONG cumulative_min_time
-    PY_LONG_LONG cumulative_max_time
+    PY_LONG_LONG cumulative_min
+    PY_LONG_LONG cumulative_max
 
 
 cdef class LineProfiler:
@@ -381,9 +417,8 @@ cdef class LineProfiler:
         
         codes = {code_hash: code for code, code_hashes in self.code_hash_map.items() for code_hash in code_hashes}
 
-        stats = {}
-        new_timings = {}
-        new_call_stats = {}
+        timings = {}
+        call_stats = {}
         for code, code_hashes in self.code_hash_map.items():
             cmap = self._c_code_map
             entries = []
@@ -394,29 +429,35 @@ cdef class LineProfiler:
             numbers = {}
             for e in entries:
                 line_number = e["lineno"]
-                nhits, cumulative_time, new_total_time, new_cumulative_time = numbers.get(line_number, (0, 0, 0, 0))
+                hit_count, cumulative_time, total_time = numbers.get(line_number, (0, 0, 0))
                 numbers[line_number] = (
-                    nhits + e["nhits"],
+                    hit_count + e["nhits"],
                     cumulative_time + e["cumulative_time"],
-                    new_total_time + e["new_total_time"],
-                    new_cumulative_time + e["new_cumulative_time"],
+                    total_time + e["total_time"],
                 )
-            entries = [(line_number, nhits, cumulative_time) for line_number, (nhits, cumulative_time, _, _) in numbers.items()]
-            new_timings[key] = [(line_number, new_total_time, new_cumulative_time) for line_number, (_, _, new_total_time, new_cumulative_time) in numbers.items()]
+            timings[key] = [
+                Timing(line_number=line_number, hit_count=hit_count, cumulative_time=cumulative_time, total_time=total_time)
+                for line_number, (hit_count, cumulative_time, total_time) in numbers.items()
+            ]
 
             cmap = self._c_call
             for caller_hash, calls in cmap.items():
-                caller_stats = new_call_stats.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
+                caller_stats = call_stats.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
                 for callee_hash, call in calls.items():
                     callee_stats = caller_stats.setdefault(None if caller_hash == 0 else call['call_line'], {})
                     callee_stats = callee_stats.setdefault(label(codes[callee_hash]), {})
-                    callee_stats[call['return_line']] = (
-                        (call['total_s0'], call['total_s1'], call['total_s2'], call['total_min_time'], call['total_max_time']),
-                        (call['cumulative_s0'], call['cumulative_s1'], call['cumulative_s2'], call['cumulative_min_time'], call['cumulative_max_time']),
+                    callee_stats[call['return_line']] = CallStats(
+                        total_stats=TimeStats(
+                            sum_0=call['total_s0'], sum_1=call['total_s1'], sum_2=call['total_s2'],
+                            min=call['total_min'], max=call['total_max'],
+                        ),
+                        cumulative_stats=TimeStats(
+                            sum_0=call['cumulative_s0'], sum_1=call['cumulative_s1'], sum_2=call['cumulative_s2'],
+                            min=call['cumulative_min'], max=call['cumulative_max'],
+                        ),
                     )
 
-            stats[key] = entries
-        return LineStats(stats, new_timings, new_call_stats, self.timer_unit)
+        return LineStats(timings=timings, call_stats=call_stats, unit=self.timer_unit)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -460,6 +501,7 @@ PyObject *arg):
 
                 sub.code_hash = code_hash
                 sub.line_number = get_line_number(py_frame)
+                sub.hit = True
                 sub.time = hpTimer()
 
             elif what == PyTrace_RETURN:
@@ -474,20 +516,20 @@ PyObject *arg):
                 if call.total_s0 == 0:
                     call.call_line = sub.line_number
                     call.return_line = get_line_number(py_frame)
-                    call.cumulative_min_time = sub.cumulative_time
-                    call.cumulative_max_time = sub.cumulative_time
-                    call.total_min_time = sub.total_time
-                    call.total_max_time = sub.total_time
+                    call.cumulative_min = sub.cumulative_time
+                    call.cumulative_max = sub.cumulative_time
+                    call.total_min = sub.total_time
+                    call.total_max = sub.total_time
                 call.total_s0 += 1
                 call.total_s1 += sub.total_time
                 call.total_s2 += <double>sub.total_time * <double>sub.total_time
-                call.total_min_time = min(call.total_min_time, sub.total_time)
-                call.total_max_time = max(call.total_max_time, sub.total_time)
+                call.total_min = min(call.total_min, sub.total_time)
+                call.total_max = max(call.total_max, sub.total_time)
                 call.cumulative_s0 += 1
                 call.cumulative_s1 += sub.cumulative_time
                 call.cumulative_s2 += <double>sub.cumulative_time * <double>sub.cumulative_time
-                call.cumulative_min_time = min(call.cumulative_min_time, sub.cumulative_time)
-                call.cumulative_max_time = max(call.cumulative_max_time, sub.cumulative_time)
+                call.cumulative_min = min(call.cumulative_min, sub.cumulative_time)
+                call.cumulative_max = max(call.cumulative_max, sub.cumulative_time)
 
                 sub.total_time = sub.total_times.back()
                 sub.total_times.pop_back()
@@ -506,12 +548,12 @@ cdef _record_time(LineProfiler self, PY_LONG_LONG time, _Sub* sub):
         if line_time.code == 0:
             line_time.code = sub.code_hash
             line_time.lineno = sub.line_number
-        line_time.new_total_time += time - sub.time
-        line_time.new_cumulative_time += time - sub.time + sub.sub_cumulative_time
-        line_time.cumulative_time = line_time.new_cumulative_time  # TODO
-        line_time.nhits = 1  # TODO
+        line_time.nhits += sub.hit
+        line_time.total_time += time - sub.time
+        line_time.cumulative_time += time - sub.time + sub.sub_cumulative_time
 
         sub.total_time += time - sub.time
         sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
 
+        sub.hit = False
         sub.sub_cumulative_time = 0
