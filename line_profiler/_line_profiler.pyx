@@ -162,8 +162,10 @@ class LineStats(object):
     unit : float
         The number of seconds per timer unit.
     """
-    def __init__(self, timings, call_stats, unit):
+    def __init__(self, timings, block_times, call_times, call_stats, unit):
         self.timings = timings
+        self.block_times = block_times
+        self.call_times = call_times
         self.call_stats = call_stats
         self.unit = unit
 
@@ -206,8 +208,8 @@ class TimeStats:
 
 cdef struct _Sub:
     PY_LONG_LONG time
-    int64 code_hash
-    vector[int64] code_hashes
+    int64 block_hash
+    vector[int64] block_hashes
     int line_number
     vector[int] line_numbers
     bool hit
@@ -216,6 +218,11 @@ cdef struct _Sub:
     PY_LONG_LONG cumulative_time
     vector[PY_LONG_LONG] cumulative_times
     PY_LONG_LONG sub_cumulative_time
+
+
+cdef struct _CallTime:
+    int call_line
+    PY_LONG_LONG cumulative_time
 
 
 cdef struct _Call:
@@ -259,14 +266,17 @@ cdef class LineProfiler:
     # Mapping between thread-id and map of LastTime
     cdef unordered_map[int64, unordered_map[int64, LastTime]] _c_last_time
     cdef unordered_map[int64, _Sub] _c_sub
+    cdef unordered_map[int64, PY_LONG_LONG] _c_block_time
+    cdef unordered_map[int64, unordered_map[int64, _CallTime]] _c_call_time
     cdef unordered_map[int64, unordered_map[int64, _Call]] _c_call
     cdef public list functions
-    cdef public dict code_hash_map, dupes_map
+    cdef public dict block_hash_map, code_hash_map, dupes_map
     cdef public double timer_unit
     cdef public object threaddata
 
     def __init__(self, *functions):
         self.functions = []
+        self.block_hash_map = {}
         self.code_hash_map = {}
         self.dupes_map = {}
         self.timer_unit = hpTimerUnit()
@@ -301,13 +311,14 @@ cdef class LineProfiler:
         else:
             codes.append(code)
             # code hash already exists, so there must be a duplicate function. add no-op
-            co_code = code.co_code + (9).to_bytes(1, byteorder=byteorder) * len(codes)
+            co_code = code.co_code + (9).to_bytes(2, byteorder=byteorder) * len(codes)
             CodeType = type(code)
             code = _code_replace(func, co_code=co_code)
             try:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
+        self.block_hash_map.setdefault(code, []).append(hash(code.co_code))
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
         # See if this can be sped up by not needing to iterate over every byte
         code_hashes = self.code_hash_map.get(code)
@@ -416,8 +427,11 @@ cdef class LineProfiler:
         cdef dict cmap
         
         codes = {code_hash: code for code, code_hashes in self.code_hash_map.items() for code_hash in code_hashes}
+        codes.update((block_hash, code) for code, block_hashes in self.block_hash_map.items() for block_hash in block_hashes)
 
         timings = {}
+        block_times = {}
+        call_times = {}
         call_stats = {}
         for code, code_hashes in self.code_hash_map.items():
             cmap = self._c_code_map
@@ -440,6 +454,17 @@ cdef class LineProfiler:
                 for line_number, (hit_count, cumulative_time, total_time) in numbers.items()
             ]
 
+            cmap = self._c_block_time
+            for block_hash, cumulative_time in cmap.items():
+                block_times[label(codes[block_hash])] = cumulative_time
+
+            cmap = self._c_call_time
+            for caller_hash, times in cmap.items():
+                caller_times = call_times.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
+                for block_hash, call_time in times.items():
+                    callee_times = caller_times.setdefault(None if caller_hash == 0 else call_time['call_line'], {})
+                    callee_times[label(codes[block_hash])] = call_time['cumulative_time']
+
             cmap = self._c_call
             for caller_hash, calls in cmap.items():
                 caller_stats = call_stats.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
@@ -457,7 +482,7 @@ cdef class LineProfiler:
                         ),
                     )
 
-        return LineStats(timings=timings, call_stats=call_stats, unit=self.timer_unit)
+        return LineStats(timings=timings, block_times=block_times, call_times=call_times, call_stats=call_stats, unit=self.timer_unit)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -470,6 +495,8 @@ PyObject *arg):
     cdef int64 block_hash
     cdef int64 code_hash
     cdef _Sub* sub
+    cdef int index
+    cdef _CallTime* call_time
     cdef _Call* call
 
     self = <LineProfiler>self_
@@ -483,36 +510,42 @@ PyObject *arg):
             ident = threading.get_ident()
             sub = &self._c_sub[ident]
 
-            if what == PyTrace_CALL:
-                _record_time(self, time, sub)
+            _record_time(self, time, sub)
 
-                sub.code_hashes.push_back(sub.code_hash)
+            if what == PyTrace_CALL:
+                sub.block_hashes.push_back(sub.block_hash)
                 sub.line_numbers.push_back(sub.line_number)
                 sub.total_times.push_back(sub.total_time)
                 sub.cumulative_times.push_back(sub.cumulative_time)
 
-                sub.code_hash = 0
+                sub.block_hash = 0
+                sub.line_number = 0
                 sub.total_time = 0
                 sub.cumulative_time = 0
                 sub.sub_cumulative_time = 0
 
             elif what == PyTrace_LINE:
-                _record_time(self, time, sub)
-
-                sub.code_hash = code_hash
+                sub.block_hash = block_hash
                 sub.line_number = get_line_number(py_frame)
                 sub.hit = True
-                sub.time = hpTimer()
 
             elif what == PyTrace_RETURN:
-                _record_time(self, time, sub)
+                for index in range(1, sub.block_hashes.size()):
+                    if sub.block_hashes[index - 1] == sub.block_hashes.back() and sub.line_numbers[index - 1] == sub.line_numbers.back() \
+                       and sub.block_hashes[index] == block_hash:
+                        break
+                else:
+                    call_time = &self._c_call_time[compute_line_hash(sub.block_hashes.back(), sub.line_numbers.back())][block_hash]
+                    if call_time.call_line == 0:
+                        call_time.call_line = sub.line_numbers.back()
+                    call_time.cumulative_time += sub.cumulative_time
 
-                sub.code_hash = sub.code_hashes.back()
-                sub.code_hashes.pop_back()
+                sub.block_hash = sub.block_hashes.back()
+                sub.block_hashes.pop_back()
                 sub.line_number = sub.line_numbers.back()
                 sub.line_numbers.pop_back()
 
-                call = &self._c_call[sub.code_hash][code_hash]
+                call = &self._c_call[compute_line_hash(sub.block_hash, sub.line_number)][code_hash]
                 if call.total_s0 == 0:
                     call.call_line = sub.line_number
                     call.return_line = get_line_number(py_frame)
@@ -537,23 +570,45 @@ PyObject *arg):
                 sub.cumulative_time = sub.cumulative_times.back()
                 sub.cumulative_times.pop_back()
 
-                sub.time = hpTimer()
+            sub.time = hpTimer()
 
     return 0
 
 
-cdef _record_time(LineProfiler self, PY_LONG_LONG time, _Sub* sub):
-    if sub.code_hash != 0:
-        line_time = &self._c_code_map[sub.code_hash][sub.line_number]
-        if line_time.code == 0:
-            line_time.code = sub.code_hash
-            line_time.lineno = sub.line_number
-        line_time.nhits += sub.hit
-        line_time.total_time += time - sub.time
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _record_time(LineProfiler self, PY_LONG_LONG time, _Sub* sub):
+    cdef int64 code_hash
+    cdef LineTime* line_time
+    cdef int index
+
+    if sub.block_hash == 0:
+        return
+
+    code_hash = compute_line_hash(sub.block_hash, sub.line_number)
+    line_time = &self._c_code_map[code_hash][sub.line_number]
+    if line_time.code == 0:
+        line_time.code = code_hash
+        line_time.lineno = sub.line_number
+    line_time.nhits += sub.hit
+    line_time.total_time += time - sub.time
+
+    index = 0
+    for block_hash in sub.block_hashes:
+        if compute_line_hash(block_hash, sub.line_numbers[index]) == code_hash:
+            break
+        index += 1
+    else:
         line_time.cumulative_time += time - sub.time + sub.sub_cumulative_time
 
-        sub.total_time += time - sub.time
-        sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
+    for block_hash in sub.block_hashes:
+        if block_hash == sub.block_hash:
+            break
+    else:
+        self._c_block_time[sub.block_hash] += time - sub.time + sub.sub_cumulative_time
 
-        sub.hit = False
-        sub.sub_cumulative_time = 0
+    sub.total_time += time - sub.time
+    sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
+
+    sub.hit = False
+    sub.sub_cumulative_time = 0

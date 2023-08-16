@@ -145,7 +145,7 @@ class LineProfiler(CLineProfiler):
         """ Show the gathered statistics.
         """
         lstats = self.get_stats()
-        show_text(lstats.timings, lstats.unit, output_unit=output_unit, stream=stream, stripzeros=stripzeros)
+        show_text(lstats.timings, lstats.unit, output_unit=output_unit, stream=stream, stripzeros=stripzeros, block_times=getattr(lstats, "block_times", None))
 
     def run(self, cmd):
         """ Profile a single executable statment in the main namespace.
@@ -205,7 +205,7 @@ def is_ipython_kernel_cell(filename):
 
 
 def show_func(filename, start_lineno, func_name, timings, unit,
-              output_unit=None, stream=None, stripzeros=False):
+              output_unit=None, stream=None, stripzeros=False, block_time=None):
     """ Show results for a single function.
     """
     if stream is None:
@@ -218,6 +218,9 @@ def show_func(filename, start_lineno, func_name, timings, unit,
     for lineno, nhits, time in timings:
         total_time += time
         linenos.append(lineno)
+
+    if block_time is not None:
+        total_time = block_time
 
     if stripzeros and total_time == 0:
         return
@@ -271,7 +274,7 @@ def show_func(filename, start_lineno, func_name, timings, unit,
     stream.write('\n')
 
 
-def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False):
+def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False, block_times=None):
     """ Show text for the given timings.
     """
     if stream is None:
@@ -282,10 +285,11 @@ def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False):
     else:
         stream.write('Timer unit: %g s\n\n' % unit)
 
-    for (fn, lineno, name), timings in sorted(stats.items()):
-        show_func(fn, lineno, name, stats[fn, lineno, name], unit,
+    for key, timings in sorted(stats.items()):
+        fn, lineno, name = key
+        show_func(fn, lineno, name, stats[key], unit,
                   output_unit=output_unit, stream=stream,
-                  stripzeros=stripzeros)
+                  stripzeros=stripzeros, block_time=None if block_times is None else block_times[key])
 
 
 def load_stats(filename):
@@ -322,7 +326,7 @@ def main():
 
     args = parser.parse_args()
     lstats = load_stats(args.profile_output)
-    show_text(lstats.timings, lstats.unit, output_unit=args.unit, stripzeros=args.skip_zero)
+    show_text(lstats.timings, lstats.unit, output_unit=args.unit, stripzeros=args.skip_zero, block_times=getattr(lstats, "block_times", None))
 
 
 if __name__ == '__main__':
