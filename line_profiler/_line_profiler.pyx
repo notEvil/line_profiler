@@ -1,11 +1,14 @@
 #cython: language_level=3
 from .python25 cimport PyFrameObject, PyObject, PyStringObject
+from preshed.maps cimport PreshMap
 from sys import byteorder
 cimport cython
+from cpython.object cimport PyObject_Hash
 from cpython.version cimport PY_VERSION_HEX
 from libc.stdint cimport int64_t
 
 from libcpp cimport bool
+from libcpp.cast cimport reinterpret_cast
 from libcpp.unordered_map cimport unordered_map
 from libcpp.vector cimport vector
 import threading
@@ -13,6 +16,13 @@ import threading
 # long long int is at least 64 bytes assuming c99
 ctypedef unsigned long long int uint64
 ctypedef long long int int64
+
+cdef extern from "pythread.h":
+    cdef int PyThread_tss_is_created(Py_tss_t *key)
+    cdef int PyThread_tss_create(Py_tss_t *key)
+    cdef int PyThread_tss_set(Py_tss_t *key, void *value)
+    cdef void* PyThread_tss_get(Py_tss_t *key)
+    cdef struct Py_tss_t
 
 # FIXME: there might be something special we have to do here for Python 3.11
 cdef extern from "frameobject.h":
@@ -84,19 +94,19 @@ cdef extern from "Python.h":
     cdef int PyTrace_C_EXCEPTION
     cdef int PyTrace_C_RETURN
 
-cdef extern from "timers.c":
+cdef extern from "timers.h":
     PY_LONG_LONG hpTimer()
     double hpTimerUnit()
 
-cdef extern from "unset_trace.c":
+cdef extern from "unset_trace.h":
     void unset_trace()
 
 cdef struct LineTime:
-    int64 code
-    int lineno
     PY_LONG_LONG cumulative_time
     PY_LONG_LONG total_time
+    int64 code
     long nhits
+    int lineno
     
 cdef struct LastTime:
     int f_lineno
@@ -208,36 +218,36 @@ class TimeStats:
 
 cdef struct _Sub:
     PY_LONG_LONG time
-    int64 block_hash
-    vector[int64] block_hashes
-    int line_number
-    vector[int] line_numbers
-    bool hit
     PY_LONG_LONG total_time
-    vector[PY_LONG_LONG] total_times
     PY_LONG_LONG cumulative_time
-    vector[PY_LONG_LONG] cumulative_times
     PY_LONG_LONG sub_cumulative_time
+    int64 block_hash
+    int line_number
+    bool hit
+    vector[PY_LONG_LONG] total_times
+    vector[PY_LONG_LONG] cumulative_times
+    vector[int64] block_hashes
+    vector[int] line_numbers
 
 
 cdef struct _CallTime:
-    int call_line
     PY_LONG_LONG cumulative_time
+    int call_line
 
 
 cdef struct _Call:
-    int call_line
-    int return_line
     PY_LONG_LONG total_s0
     PY_LONG_LONG total_s1
-    double total_s2
     PY_LONG_LONG total_min
     PY_LONG_LONG total_max
     PY_LONG_LONG cumulative_s0
     PY_LONG_LONG cumulative_s1
-    double cumulative_s2
     PY_LONG_LONG cumulative_min
     PY_LONG_LONG cumulative_max
+    double total_s2
+    double cumulative_s2
+    int call_line
+    int return_line
 
 
 cdef class LineProfiler:
@@ -273,6 +283,9 @@ cdef class LineProfiler:
     cdef public dict block_hash_map, code_hash_map, dupes_map
     cdef public double timer_unit
     cdef public object threaddata
+    # sadly we can't put a preshmap inside a preshmap
+    # so we can only use it to speed up top-level lookups
+    cdef PreshMap _c_thread_ids
 
     def __init__(self, *functions):
         self.functions = []
@@ -281,6 +294,7 @@ cdef class LineProfiler:
         self.dupes_map = {}
         self.timer_unit = hpTimerUnit()
         self.threaddata = threading.local()
+        self._c_thread_ids = PreshMap(initial_size=2)
 
         for func in functions:
             self.add_function(func)
@@ -498,16 +512,24 @@ PyObject *arg):
     cdef int index
     cdef _CallTime* call_time
     cdef _Call* call
+    cdef Py_tss_t tss_key
+    # empty key is 0 and deleted key is 1
+    cdef uint64 sentinel = 2, ident
 
     self = <LineProfiler>self_
 
     if what == PyTrace_LINE or what == PyTrace_CALL or what == PyTrace_RETURN:
         # Normally we'd need to DECREF the return from get_frame_code, but Cython does that for us
         time = hpTimer()
-        block_hash = hash(get_frame_code(py_frame))
+        block_hash = PyObject_Hash(get_frame_code(py_frame))
         code_hash = compute_line_hash(block_hash, get_line_number(py_frame))
         if self._c_code_map.count(code_hash):
-            ident = threading.get_ident()
+            ident = reinterpret_cast[uint64](PyThread_tss_get(&tss_key))
+            if reinterpret_cast[uint64](self._c_thread_ids.get(ident)):
+                PyThread_tss_set(&tss_key, &ident)
+                self._c_thread_ids.set(ident, &sentinel)
+                # we have a new tss value -- redo ident
+                ident = reinterpret_cast[uint64](PyThread_tss_get(&tss_key))
             sub = &self._c_sub[ident]
 
             _record_time(self, time, sub)
