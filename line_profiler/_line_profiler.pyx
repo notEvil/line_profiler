@@ -5,7 +5,6 @@ cimport cython
 from cpython.version cimport PY_VERSION_HEX
 from libc.stdint cimport int64_t
 
-from libcpp cimport bool
 from libcpp.unordered_map cimport unordered_map
 from libcpp.vector cimport vector
 import threading
@@ -19,16 +18,23 @@ cdef extern from "frameobject.h":
     """
     inline PyObject* get_frame_code(PyFrameObject* frame) {
         #if PY_VERSION_HEX < 0x030B0000
-            Py_INCREF(frame->f_code->co_code);
-            return frame->f_code->co_code;
+            Py_INCREF(frame->f_code);
+            return frame->f_code;
         #else
-            PyCodeObject* code = PyFrame_GetCode(frame);
-            PyObject* ret = PyCode_GetCode(code);
-            Py_DECREF(code);
-            return ret;
+            return (PyObject*)PyFrame_GetCode(frame);
         #endif
     }
-    inline int get_line_number(PyFrameObject* frame) {
+
+    inline PyObject* get_code_code(PyCodeObject* code) {
+        #if PY_VERSION_HEX < 0x030B0000
+            Py_INCREF(code->co_code);
+            return code->co_code;
+        #else
+            return (PyObject*)PyCode_GetCode(code);
+        #endif
+    }
+
+    inline int get_frame_lineno(PyFrameObject* frame) {
         #if PY_VERSION_HEX < 0x030B0000
             return frame->f_lineno;
         #else
@@ -37,7 +43,8 @@ cdef extern from "frameobject.h":
     }
     """
     cdef object get_frame_code(PyFrameObject* frame)
-    cdef int get_line_number(PyFrameObject* frame)
+    cdef object get_code_code(PyCodeObject* code)
+    cdef int get_frame_lineno(PyFrameObject* frame)
     ctypedef int (*Py_tracefunc)(object self, PyFrameObject *py_frame, int what, PyObject *arg)
 
 cdef extern from "Python.h":
@@ -91,16 +98,13 @@ cdef extern from "timers.c":
 cdef extern from "unset_trace.c":
     void unset_trace()
 
-cdef struct LineTime:
+cdef struct CLineProfile:
     int64 code
-    int lineno
-    PY_LONG_LONG cumulative_time
+    int line_number
+    long hit_count
+    long primitive_hit_count
     PY_LONG_LONG total_time
-    long nhits
-    
-cdef struct LastTime:
-    int f_lineno
-    PY_LONG_LONG time
+    PY_LONG_LONG cumulative_time
 
 cdef inline int64 compute_line_hash(uint64 block_hash, uint64 linenum):
     """
@@ -120,7 +124,7 @@ def label(code):
     This is the same labelling as used by the cProfile module in Python 2.5.
     """
     if isinstance(code, str):
-        return ('~', 0, code)    # built-in functions ('~' sorts at the end)
+        return ("~", 0, code)    # built-in functions ('~' sorts at the end)
     else:
         return (code.co_filename, code.co_firstlineno, code.co_name)
 
@@ -133,7 +137,7 @@ cpdef _code_replace(func, co_code):
         code = func.__code__
     except AttributeError:
         code = func.__func__.__code__
-    if hasattr(code, 'replace'):
+    if hasattr(code, "replace"):
         # python 3.8+
         code = code.replace(co_code=co_code)
     else:
@@ -156,35 +160,65 @@ class LineStats(object):
     ----------
     timings : dict
         Mapping from (filename, first_lineno, function_name) of the profiled
-        function to a list of (lineno, nhits, cumulative_time) tuples for each
-        profiled line. cumulative_time is an integer in the native units of the
+        function to a list of (lineno, nhits, total_time) tuples for each
+        profiled line. total_time is an integer in the native units of the
         timer.
     unit : float
         The number of seconds per timer unit.
     """
-    def __init__(self, timings, block_times, call_times, call_stats, unit):
+    def __init__(self, timings=None, unit=None,
+                       line_profiles=None, block_profiles=None, call_profiles=None,
+                       call_stats=None):
+        super().__init__()
+
+        # backwards compat
+        if line_profiles is None:
+            line_profiles = timings
+        else:
+            timings = line_profiles
+
         self.timings = timings
-        self.block_times = block_times
-        self.call_times = call_times
-        self.call_stats = call_stats
         self.unit = unit
+        self.line_profiles = timings
+        self.block_profiles = block_profiles
+        self.call_profiles = call_profiles
+        self.call_stats = call_stats
 
 
-class Timing(tuple):
-    def __init__(self, line_number, hit_count, cumulative_time, total_time):
+class LineProfile(tuple):
+    def __init__(self, line_number, hit_count, primitive_hit_count, total_time, cumulative_time):
         super().__init__()
 
         self.line_number = line_number
         self.hit_count = hit_count
-        self.cumulative_time = cumulative_time
+        self.primitive_hit_count = primitive_hit_count
         self.total_time = total_time
+        self.cumulative_time = cumulative_time
 
     # compatibility
-    def __new__(cls, line_number, hit_count, cumulative_time, *args, **kwargs):
-        return tuple.__new__(cls, (line_number, hit_count, cumulative_time))
+    def __new__(cls, line_number, hit_count, primitive_hit_count, total_time, cumulative_time):
+        return super().__new__(cls, (line_number, hit_count, cumulative_time))
 
     def __reduce__(self):
-        return (Timing, (self.line_number, self.hit_count, self.cumulative_time, self.total_time))
+        return (LineProfile, (self.line_number, self.hit_count, self.primitive_hit_count, self.total_time, self.cumulative_time))
+
+
+class BlockProfile:
+    def __init__(self, hit_count, primitive_hit_count, cumulative_time):
+        super().__init__()
+
+        self.hit_count = hit_count
+        self.primitive_hit_count = primitive_hit_count
+        self.cumulative_time = cumulative_time
+
+
+class CallProfile:
+    def __init__(self, hit_count, primitive_hit_count, cumulative_time):
+        super().__init__()
+
+        self.hit_count = hit_count
+        self.primitive_hit_count = primitive_hit_count
+        self.cumulative_time = cumulative_time
 
 
 class CallStats:
@@ -206,13 +240,14 @@ class TimeStats:
         self.max = max
 
 
-cdef struct _Sub:
+cdef struct Sub:
     PY_LONG_LONG time
     int64 block_hash
     vector[int64] block_hashes
     int line_number
     vector[int] line_numbers
-    bool hit
+    bint line_hit
+    long block_hit
     PY_LONG_LONG total_time
     vector[PY_LONG_LONG] total_times
     PY_LONG_LONG cumulative_time
@@ -220,12 +255,20 @@ cdef struct _Sub:
     PY_LONG_LONG sub_cumulative_time
 
 
-cdef struct _CallTime:
-    int call_line
+cdef struct CBlockProfile:
+    long hit_count
+    long primitive_hit_count
     PY_LONG_LONG cumulative_time
 
 
-cdef struct _Call:
+cdef struct CCallProfile:
+    int call_line
+    long hit_count
+    long primitive_hit_count
+    PY_LONG_LONG cumulative_time
+
+
+cdef struct CCallStats:
     int call_line
     int return_line
     PY_LONG_LONG total_s0
@@ -262,13 +305,11 @@ cdef class LineProfiler:
         >>> # Print stats
         >>> self.print_stats()
     """
-    cdef unordered_map[int64, unordered_map[int64, LineTime]] _c_code_map
-    # Mapping between thread-id and map of LastTime
-    cdef unordered_map[int64, unordered_map[int64, LastTime]] _c_last_time
-    cdef unordered_map[int64, _Sub] _c_sub
-    cdef unordered_map[int64, PY_LONG_LONG] _c_block_time
-    cdef unordered_map[int64, unordered_map[int64, _CallTime]] _c_call_time
-    cdef unordered_map[int64, unordered_map[int64, _Call]] _c_call
+    cdef unordered_map[int64, Sub] _c_subs  # {thread id: Sub}
+    cdef unordered_map[int64, unordered_map[int64, CLineProfile]] _c_line_profiles  # {thread id: {code hash: CLineProfile}}
+    cdef unordered_map[int64, CBlockProfile] _c_block_profiles  # {block hash: CBlockProfile}
+    cdef unordered_map[int64, unordered_map[int64, CCallProfile]] _c_call_profiles  # {code hash: {block hash: CCallProfile}}
+    cdef unordered_map[int64, unordered_map[int64, CCallStats]] _c_call_stats  # {code hash: {code hash: CCallStats}}
     cdef public list functions
     cdef public dict block_hash_map, code_hash_map, dupes_map
     cdef public double timer_unit
@@ -318,29 +359,23 @@ cdef class LineProfiler:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        self.block_hash_map.setdefault(code, []).append(hash(code.co_code))
+        block_hash = hash(code.co_code)
+        self.block_hash_map.setdefault(code, []).append(block_hash)
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
         # See if this can be sped up by not needing to iterate over every byte
-        code_hashes = self.code_hash_map.get(code)
-        if code_hashes is None:
-            previous_line = -1
-            block_hash = hash(code.co_code)
-            code_hashes = []
-            for offset, byte in enumerate(code.co_code):
-                line = PyCode_Addr2Line(<PyCodeObject*>code, offset)
-                if line != previous_line:
-                    code_hash = compute_line_hash(block_hash, line)
-                    code_hashes.append(code_hash)
-                    self._c_code_map[code_hash]
-                    previous_line = line
-            self.code_hash_map[code] = code_hashes
-            self._c_code_map[compute_line_hash(block_hash, code.co_firstlineno)]  # PyTrace_CALL
+        code_hashes = set()
+        for offset, byte in enumerate(code.co_code):
+            code_hash = compute_line_hash(block_hash, PyCode_Addr2Line(<PyCodeObject*>code, offset))
+            code_hashes.add(code_hash)
+            self._c_line_profiles[code_hash]
+        self._c_line_profiles[compute_line_hash(block_hash, code.co_firstlineno)]  # PyTrace_CALL
+        self.code_hash_map[code] = code_hashes
 
         self.functions.append(func)
 
     property enable_count:
         def __get__(self):
-            if not hasattr(self.threaddata, 'enable_count'):
+            if not hasattr(self.threaddata, "enable_count"):
                 self.threaddata.enable_count = 0
             return self.threaddata.enable_count
         def __set__(self, value):
@@ -376,11 +411,15 @@ cdef class LineProfiler:
         """
         A Python view of the internal C lookup table.
         """
-        return <dict>self._c_code_map
+        return <dict>self._c_line_profiles
         
     @property
     def c_last_time(self):
-        return (<dict>self._c_last_time)[threading.get_ident()]
+        """
+        TODO for backwards compatibility
+        """
+        cdef Sub* sub = &self._c_subs[threading.get_ident()]
+        return {sub.block_hash: dict(f_lineno=sub.line_number, time=sub.time)}
 
     @property
     def code_map(self):
@@ -388,19 +427,16 @@ cdef class LineProfiler:
         line_profiler 4.0 no longer directly maintains code_map, but this will
         construct something similar for backwards compatibility.
         """
-        c_code_map = self.c_code_map
-        py_code_map = {}
+        cdef dict line_profiles = self._c_line_profiles
+        code_map = {}
         for code, code_hashes in self.code_hash_map.items():
-            py_code_map.setdefault(code, {})
+            entries = code_map.setdefault(code, {})
             for code_hash in code_hashes:
-                c_entries = c_code_map[code_hash]
-                py_entries = {}
-                for key, c_entry in c_entries.items():
-                    py_entry = c_entry.copy()
-                    py_entry['code'] = code
-                    py_entries[key] = py_entry
-                py_code_map[code].update(py_entries)
-        return py_code_map
+                for key, entry in line_profiles[code_hash].items():
+                    entry = entry.copy()
+                    entry["code"] = code
+                    entries[key] = entry
+        return code_map
 
     @property
     def last_time(self):
@@ -408,81 +444,81 @@ cdef class LineProfiler:
         line_profiler 4.0 no longer directly maintains last_time, but this will
         construct something similar for backwards compatibility.
         """
-        c_last_time = (<dict>self._c_last_time)[threading.get_ident()]
-        py_last_time = {}
-        for code, code_hashes in self.code_hash_map.items():
-            for code_hash in code_hashes:
-                if code_hash in c_last_time:
-                    py_last_time[code] = c_last_time[code_hash]
-        return py_last_time
-
+        cdef Sub* sub = &self._c_subs[threading.get_ident()]
+        code_hash = compute_line_hash(sub.block_hash, sub.line_number)
+        return {
+            code: dict(f_lineno=sub.line_number, time=sub.time)
+            for code, code_hashes in self.code_hash_map.items()
+            if code_hash in code_hashes
+        }
 
     cpdef disable(self):
-        self._c_last_time[threading.get_ident()].clear()
         unset_trace()
 
     def get_stats(self):
         """ Return a LineStats object containing the timings.
         """
-        cdef dict cmap
+        codes = {
+            code_hash: code
+            for code, code_hashes in self.code_hash_map.items()
+            for code_hash in code_hashes
+        }
+        codes.update(
+            (block_hash, code)
+            for code, block_hashes in self.block_hash_map.items()
+            for block_hash in block_hashes
+        )
         
-        codes = {code_hash: code for code, code_hashes in self.code_hash_map.items() for code_hash in code_hashes}
-        codes.update((block_hash, code) for code, block_hashes in self.block_hash_map.items() for block_hash in block_hashes)
-
-        timings = {}
-        block_times = {}
-        call_times = {}
-        call_stats = {}
+        c_line_profiles = <dict>self._c_line_profiles
+        line_profiles = {}
         for code, code_hashes in self.code_hash_map.items():
-            cmap = self._c_code_map
-            entries = []
-            for code_hash in code_hashes:
-                entries.extend(cmap[code_hash].values())
-            key = label(code)
-
             numbers = {}
-            for e in entries:
-                line_number = e["lineno"]
-                hit_count, cumulative_time, total_time = numbers.get(line_number, (0, 0, 0))
-                numbers[line_number] = (
-                    hit_count + e["nhits"],
-                    cumulative_time + e["cumulative_time"],
-                    total_time + e["total_time"],
-                )
-            timings[key] = [
-                Timing(line_number=line_number, hit_count=hit_count, cumulative_time=cumulative_time, total_time=total_time)
-                for line_number, (hit_count, cumulative_time, total_time) in numbers.items()
+            for code_hash in code_hashes:
+                for entry in c_line_profiles[code_hash].values():
+                    line_number = entry["line_number"]
+                    hit_count, primitive_hit_count, total_time, cumulative_time = numbers.get(line_number, (0, 0, 0, 0))
+                    numbers[line_number] = (
+                        hit_count + entry["hit_count"],
+                        primitive_hit_count + entry["primitive_hit_count"],
+                        total_time + entry["total_time"],
+                        cumulative_time + entry["cumulative_time"],
+                    )
+            line_profiles[label(code)] = [
+                LineProfile(line_number, hit_count, primitive_hit_count, total_time, cumulative_time)
+                for line_number, (hit_count, primitive_hit_count, total_time, cumulative_time) in numbers.items()
             ]
 
-            cmap = self._c_block_time
-            for block_hash, cumulative_time in cmap.items():
-                block_times[label(codes[block_hash])] = cumulative_time
+        block_profiles = {
+            label(codes[block_hash]): BlockProfile(dictionary["hit_count"], dictionary["primitive_hit_count"], dictionary["cumulative_time"])
+            for block_hash, dictionary in (<dict>self._c_block_profiles).items()
+        }
 
-            cmap = self._c_call_time
-            for caller_hash, times in cmap.items():
-                caller_times = call_times.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
-                for block_hash, call_time in times.items():
-                    callee_times = caller_times.setdefault(None if caller_hash == 0 else call_time['call_line'], {})
-                    callee_times[label(codes[block_hash])] = call_time['cumulative_time']
+        call_profiles = {}
+        for caller_hash, dictionary in (<dict>self._c_call_profiles).items():
+            caller_profiles = call_profiles.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
+            for block_hash, dictionary in dictionary.items():
+                callee_profiles = caller_profiles.setdefault(None if caller_hash == 0 else dictionary["call_line"], {})
+                callee_profiles[label(codes[block_hash])] = CallProfile(dictionary["hit_count"], dictionary["primitive_hit_count"], dictionary["cumulative_time"])
 
-            cmap = self._c_call
-            for caller_hash, calls in cmap.items():
-                caller_stats = call_stats.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
-                for callee_hash, call in calls.items():
-                    callee_stats = caller_stats.setdefault(None if caller_hash == 0 else call['call_line'], {})
-                    callee_stats = callee_stats.setdefault(label(codes[callee_hash]), {})
-                    callee_stats[call['return_line']] = CallStats(
-                        total_stats=TimeStats(
-                            sum_0=call['total_s0'], sum_1=call['total_s1'], sum_2=call['total_s2'],
-                            min=call['total_min'], max=call['total_max'],
-                        ),
-                        cumulative_stats=TimeStats(
-                            sum_0=call['cumulative_s0'], sum_1=call['cumulative_s1'], sum_2=call['cumulative_s2'],
-                            min=call['cumulative_min'], max=call['cumulative_max'],
-                        ),
-                    )
+        call_stats = {}
+        for caller_hash, dictionary in (<dict>self._c_call_stats).items():
+            caller_stats = call_stats.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
+            for callee_hash, dictionary in dictionary.items():
+                callee_stats = caller_stats.setdefault(None if caller_hash == 0 else dictionary["call_line"], {})
+                callee_stats = callee_stats.setdefault(label(codes[callee_hash]), {})
+                callee_stats[dictionary["return_line"]] = CallStats(
+                    total_stats=TimeStats(
+                        sum_0=dictionary["total_s0"], sum_1=dictionary["total_s1"], sum_2=dictionary["total_s2"],
+                        min=dictionary["total_min"], max=dictionary["total_max"],
+                    ),
+                    cumulative_stats=TimeStats(
+                        sum_0=dictionary["cumulative_s0"], sum_1=dictionary["cumulative_s1"], sum_2=dictionary["cumulative_s2"],
+                        min=dictionary["cumulative_min"], max=dictionary["cumulative_max"],
+                    ),
+                )
 
-        return LineStats(timings=timings, block_times=block_times, call_times=call_times, call_stats=call_stats, unit=self.timer_unit)
+        return LineStats(line_profiles=line_profiles, block_profiles=block_profiles, call_profiles=call_profiles,
+                         call_stats=call_stats, unit=self.timer_unit)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -492,81 +528,103 @@ PyObject *arg):
     """
     cdef LineProfiler self
     cdef PY_LONG_LONG time
+    cdef object code
     cdef int64 block_hash
     cdef int64 code_hash
-    cdef _Sub* sub
+    cdef Sub* sub
     cdef int index
-    cdef _CallTime* call_time
-    cdef _Call* call
+    cdef CCallProfile* call_profile
+    cdef CCallStats* call_stats
 
     self = <LineProfiler>self_
 
     if what == PyTrace_LINE or what == PyTrace_CALL or what == PyTrace_RETURN:
-        # Normally we'd need to DECREF the return from get_frame_code, but Cython does that for us
+        """
+        - sequence: CALL -> (?P<sub>(LINE | (CALL -> (?P=sub)* -> RETURN)) -> )* -> RETURN
+          - `yield from` creates CALL -> CALL -> ... -> RETURN -> RETURN
+          - multiple calls on a single line create CALL -> ... -> RETURN -> CALL -> ... -> RETURN
+        """
         time = hpTimer()
-        block_hash = hash(get_frame_code(py_frame))
-        code_hash = compute_line_hash(block_hash, get_line_number(py_frame))
-        if self._c_code_map.count(code_hash):
+        # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
+        code = get_frame_code(py_frame)
+        block_hash = hash(get_code_code(<PyCodeObject*>code))
+        code_hash = compute_line_hash(block_hash, get_frame_lineno(py_frame))
+        if self._c_line_profiles.count(code_hash):
+            # print(f'{get_frame_lineno(py_frame):3}', {PyTrace_LINE: 'line', PyTrace_CALL: 'call', PyTrace_RETURN: 'return'}.get(what, 'other'))
             ident = threading.get_ident()
-            sub = &self._c_sub[ident]
+            sub = &self._c_subs[ident]
 
-            _record_time(self, time, sub)
+            _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
             if what == PyTrace_CALL:
+                # push to stack
                 sub.block_hashes.push_back(sub.block_hash)
                 sub.line_numbers.push_back(sub.line_number)
                 sub.total_times.push_back(sub.total_time)
                 sub.cumulative_times.push_back(sub.cumulative_time)
 
-                sub.block_hash = 0
-                sub.line_number = 0
+                if get_frame_lineno(py_frame) == code.co_firstlineno:  # function call or start generator or coroutine
+                    sub.block_hit = 0
+                else:  # continue generator or coroutine
+                    sub.block_hash = block_hash
+                    sub.line_number = get_frame_lineno(py_frame)
                 sub.total_time = 0
                 sub.cumulative_time = 0
                 sub.sub_cumulative_time = 0
 
             elif what == PyTrace_LINE:
                 sub.block_hash = block_hash
-                sub.line_number = get_line_number(py_frame)
-                sub.hit = True
+                sub.line_number = get_frame_lineno(py_frame)
+                sub.line_hit = True
 
             elif what == PyTrace_RETURN:
-                for index in range(1, sub.block_hashes.size()):
-                    if sub.block_hashes[index - 1] == sub.block_hashes.back() and sub.line_numbers[index - 1] == sub.line_numbers.back() \
-                       and sub.block_hashes[index] == block_hash:
+                call_profile = &self._c_call_profiles[compute_line_hash(sub.block_hashes.back(), sub.line_numbers.back())][block_hash]
+                if call_profile.call_line == 0:
+                    call_profile.call_line = sub.line_numbers.back()
+
+                call_profile.hit_count += 1
+
+                # primitive call
+                for index in range(sub.block_hashes.size() - 1):
+                    if sub.block_hashes[index] == sub.block_hashes.back() and sub.line_numbers[index] == sub.line_numbers.back() \
+                       and sub.block_hashes[index + 1] == block_hash:
                         break
                 else:
-                    call_time = &self._c_call_time[compute_line_hash(sub.block_hashes.back(), sub.line_numbers.back())][block_hash]
-                    if call_time.call_line == 0:
-                        call_time.call_line = sub.line_numbers.back()
-                    call_time.cumulative_time += sub.cumulative_time
+                    call_profile.primitive_hit_count += 1
+                    call_profile.cumulative_time += sub.cumulative_time
 
+                # pop location from stack
                 sub.block_hash = sub.block_hashes.back()
                 sub.block_hashes.pop_back()
                 sub.line_number = sub.line_numbers.back()
                 sub.line_numbers.pop_back()
+                #
 
-                call = &self._c_call[compute_line_hash(sub.block_hash, sub.line_number)][code_hash]
-                if call.total_s0 == 0:
-                    call.call_line = sub.line_number
-                    call.return_line = get_line_number(py_frame)
-                    call.cumulative_min = sub.cumulative_time
-                    call.cumulative_max = sub.cumulative_time
-                    call.total_min = sub.total_time
-                    call.total_max = sub.total_time
-                call.total_s0 += 1
-                call.total_s1 += sub.total_time
-                call.total_s2 += <double>sub.total_time * <double>sub.total_time
-                call.total_min = min(call.total_min, sub.total_time)
-                call.total_max = max(call.total_max, sub.total_time)
-                call.cumulative_s0 += 1
-                call.cumulative_s1 += sub.cumulative_time
-                call.cumulative_s2 += <double>sub.cumulative_time * <double>sub.cumulative_time
-                call.cumulative_min = min(call.cumulative_min, sub.cumulative_time)
-                call.cumulative_max = max(call.cumulative_max, sub.cumulative_time)
+                call_stats = &self._c_call_stats[compute_line_hash(sub.block_hash, sub.line_number)][code_hash]
+                if call_stats.total_s0 == 0:
+                    call_stats.call_line = sub.line_number
+                    call_stats.return_line = get_frame_lineno(py_frame)
+                    call_stats.cumulative_min = sub.cumulative_time
+                    call_stats.cumulative_max = sub.cumulative_time
+                    call_stats.total_min = sub.total_time
+                    call_stats.total_max = sub.total_time
 
+                call_stats.total_s0 += 1
+                call_stats.total_s1 += sub.total_time
+                call_stats.total_s2 += <double>sub.total_time * <double>sub.total_time
+                call_stats.total_min = min(call_stats.total_min, sub.total_time)
+                call_stats.total_max = max(call_stats.total_max, sub.total_time)
+                call_stats.cumulative_s0 += 1
+                call_stats.cumulative_s1 += sub.cumulative_time
+                call_stats.cumulative_s2 += <double>sub.cumulative_time * <double>sub.cumulative_time
+                call_stats.cumulative_min = min(call_stats.cumulative_min, sub.cumulative_time)
+                call_stats.cumulative_max = max(call_stats.cumulative_max, sub.cumulative_time)
+
+                sub.sub_cumulative_time = sub.cumulative_time  # similar to line_hit and block_hit
+
+                # pop remaining from stack
                 sub.total_time = sub.total_times.back()
                 sub.total_times.pop_back()
-                sub.sub_cumulative_time = sub.cumulative_time
                 sub.cumulative_time = sub.cumulative_times.back()
                 sub.cumulative_times.pop_back()
 
@@ -577,38 +635,52 @@ PyObject *arg):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cdef void _record_time(LineProfiler self, PY_LONG_LONG time, _Sub* sub):
+cdef void _record(LineProfiler self, PY_LONG_LONG time, Sub* sub):
     cdef int64 code_hash
-    cdef LineTime* line_time
+    cdef CLineProfile* line_profile
+    cdef CBlockProfile* block_profile
     cdef int index
 
-    if sub.block_hash == 0:
-        return
+    if not (sub.block_hash == 0):  # not (just entering)
+        code_hash = compute_line_hash(sub.block_hash, sub.line_number)
 
-    code_hash = compute_line_hash(sub.block_hash, sub.line_number)
-    line_time = &self._c_code_map[code_hash][sub.line_number]
-    if line_time.code == 0:
-        line_time.code = code_hash
-        line_time.lineno = sub.line_number
-    line_time.nhits += sub.hit
-    line_time.total_time += time - sub.time
+        line_profile = &self._c_line_profiles[code_hash][sub.line_number]  # get or create CLineProfile
+        line_profile.code = code_hash
+        line_profile.line_number = sub.line_number
 
-    index = 0
-    for block_hash in sub.block_hashes:
-        if compute_line_hash(block_hash, sub.line_numbers[index]) == code_hash:
-            break
-        index += 1
-    else:
-        line_time.cumulative_time += time - sub.time + sub.sub_cumulative_time
+        line_profile.hit_count += sub.line_hit
+        line_profile.total_time += time - sub.time
 
-    for block_hash in sub.block_hashes:
-        if block_hash == sub.block_hash:
-            break
-    else:
-        self._c_block_time[sub.block_hash] += time - sub.time + sub.sub_cumulative_time
+        # primitive line
+        index = 0
+        for block_hash in sub.block_hashes:
+            if compute_line_hash(block_hash, sub.line_numbers[index]) == code_hash:
+                break
+            index += 1
+        else:
+            line_profile.primitive_hit_count += sub.line_hit
+            line_profile.cumulative_time += time - sub.time + sub.sub_cumulative_time
+        #
 
-    sub.total_time += time - sub.time
-    sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
+        if sub.block_hit == 1:  # after first LINE after function call
+            block_profile = &self._c_block_profiles[sub.block_hash]
+            block_profile.hit_count += 1
 
-    sub.hit = False
-    sub.sub_cumulative_time = 0
+        # primitive block
+        for block_hash in sub.block_hashes:
+            if block_hash == sub.block_hash:
+                break
+        else:
+            block_profile = &self._c_block_profiles[sub.block_hash]
+            block_profile.primitive_hit_count += sub.block_hit == 1
+            block_profile.cumulative_time += time - sub.time + sub.sub_cumulative_time
+        #
+
+        sub.total_time += time - sub.time
+        sub.cumulative_time += time - sub.time + sub.sub_cumulative_time
+
+        # reset
+        sub.line_hit = False
+        sub.sub_cumulative_time = 0
+
+    sub.block_hit += 1
