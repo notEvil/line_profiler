@@ -1,5 +1,83 @@
 #!/usr/bin/env python
-""" Script to conveniently run profilers on code in a variety of circumstances.
+"""
+Script to conveniently run profilers on code in a variety of circumstances.
+
+To profile a script, decorate the functions of interest with ``@profile``
+
+.. code:: bash
+
+    echo "if 1:
+        @profile
+        def main():
+            1 + 1
+        main()
+    " > script_to_profile.py
+
+NOTE:
+
+    New in 4.1.0: Instead of relying on injecting ``profile`` into the builtins
+    you can now ``import line_profiler`` and use ``line_profiler.profile`` to
+    decorate your functions. This allows the script to remain functional even
+    if it is not actively profiled. See :py:mod:`line_profiler` for details.
+
+
+Then run the script using kernprof:
+
+.. code:: bash
+
+    kernprof -b script_to_profile.py
+
+By default this runs with the default :py:mod:`cProfile` profiler and does not
+require compiled modules. Instructions to view the results will be given in the
+output. Alternatively, adding ``-v`` to the command line will write results to
+stdout.
+
+To enable line-by-line profiling, then :py:mod:`line_profiler` must be
+available and compiled. Add the ``-l`` argument to the kernprof invocation.
+
+.. code:: bash
+
+    kernprof -lb script_to_profile.py
+
+
+For more details and options, refer to the CLI help.
+To view kernprof help run:
+
+.. code:: bash
+
+    kenprof --help
+
+which displays:
+
+.. code::
+
+    usage: kernprof [-h] [-V] [-l] [-b] [-o OUTFILE] [-s SETUP] [-v] [-r] [-u UNIT] [-z] [-i [OUTPUT_INTERVAL]] [-p PROF_MOD] [--prof-imports] script ...
+
+    Run and profile a python script.
+
+    positional arguments:
+      script                The python script file to run
+      args                  Optional script arguments
+
+    options:
+      -h, --help            show this help message and exit
+      -V, --version         show program's version number and exit
+      -l, --line-by-line    Use the line-by-line profiler instead of cProfile. Implies --builtin.
+      -b, --builtin         Put 'profile' in the builtins. Use 'profile.enable()'/'.disable()', '@profile' to decorate functions, or 'with profile:' to profile a section of code.
+      -o OUTFILE, --outfile OUTFILE
+                            Save stats to <outfile> (default: 'scriptname.lprof' with --line-by-line, 'scriptname.prof' without)
+      -s SETUP, --setup SETUP
+                            Code to execute before the code to profile
+      -v, --view            View the results of the profile in addition to saving it
+      -r, --rich            Use rich formatting if viewing output
+      -u UNIT, --unit UNIT  Output unit (in seconds) in which the timing info is displayed (default: 1e-6)
+      -z, --skip-zero       Hide functions which have not been called
+      -i [OUTPUT_INTERVAL], --output-interval [OUTPUT_INTERVAL]
+                            Enables outputting of cumulative profiling results to file every n seconds. Uses the threading module. Minimum value is 1 (second). Defaults to disabled.
+      -p PROF_MOD, --prof-mod PROF_MOD
+                            List of modules, functions and/or classes to profile specified by their name or path. List is comma separated, adding the current script path profiles
+                            full script. Only works with line_profiler -l, --line-by-line
+      --prof-imports        If specified, modules specified to `--prof-mod` will also autoprofile modules that they import. Only works with line_profiler -l, --line-by-line
 """
 import builtins
 import functools
@@ -11,9 +89,9 @@ import concurrent.futures  # NOQA
 import time
 from argparse import ArgumentError, ArgumentParser
 
-# NOTE: This version needs to be manually maintained with the line_profiler
-# __version__ for now.
-__version__ = '4.0.3'
+# NOTE: This version needs to be manually maintained in
+# line_profiler/line_profiler.py and line_profiler/__init__.py as well
+__version__ = '4.1.1'
 
 # Guard the import of cProfile such that 3.x people
 # without lsprof can still use this script.
@@ -133,8 +211,10 @@ class RepeatedTimer(object):
     """
     Background timer for outputting file every n seconds.
 
-    Adapted from
-    https://stackoverflow.com/questions/474528/what-is-the-best-way-to-repeatedly-execute-a-function-every-x-seconds/40965385#40965385
+    Adapted from [SO474528]_.
+
+    References:
+        .. [SO474528] https://stackoverflow.com/questions/474528/execute-function-every-x-seconds/40965385#40965385
     """
     def __init__(self, interval, dump_func, outfile):
         self._timer = None
@@ -181,7 +261,23 @@ def find_script(script_name):
     raise SystemExit(1)
 
 
+def _python_command():
+    """
+    Return a command that corresponds to :py:obj:`sys.executable`.
+    """
+    import shutil
+    if shutil.which('python') == sys.executable:
+        return 'python'
+    elif shutil.which('python3') == sys.executable:
+        return 'python3'
+    else:
+        return sys.executable
+
+
 def main(args=None):
+    """
+    Runs the command line interface
+    """
     def positive_float(value):
         val = float(value)
         if val <= 0:
@@ -203,15 +299,23 @@ def main(args=None):
                         help='Code to execute before the code to profile')
     parser.add_argument('-v', '--view', action='store_true',
                         help='View the results of the profile in addition to saving it')
+    parser.add_argument('-r', '--rich', action='store_true',
+                        help='Use rich formatting if viewing output')
     parser.add_argument('-u', '--unit', default='1e-6', type=positive_float,
-
                         help='Output unit (in seconds) in which the timing info is '
                         'displayed (default: 1e-6)')
     parser.add_argument('-z', '--skip-zero', action='store_true',
                         help="Hide functions which have not been called")
     parser.add_argument('-i', '--output-interval', type=int, default=0, const=0, nargs='?',
-                        help="Enables outputting of cumulative profiling results to file every n seconds. Uses the threading module."
+                        help="Enables outputting of cumulative profiling results to file every n seconds. Uses the threading module. "
                         "Minimum value is 1 (second). Defaults to disabled.")
+    parser.add_argument('-p', '--prof-mod', type=str, default='',
+                        help="List of modules, functions and/or classes to profile specified by their name or path. "
+                        "List is comma separated, adding the current script path profiles full script. "
+                        "Only works with line_profiler -l, --line-by-line")
+    parser.add_argument('--prof-imports', action='store_true',
+                        help="If specified, modules specified to `--prof-mod` will also autoprofile modules that they import. "
+                        "Only works with line_profiler -l, --line-by-line")
 
     parser.add_argument('script', help='The python script file to run')
     parser.add_argument('args', nargs='...', help='Optional script arguments')
@@ -241,6 +345,15 @@ def main(args=None):
         options.builtin = True
     else:
         prof = ContextualProfile()
+
+    # If line_profiler is installed, then overwrite the explicit decorator
+    try:
+        import line_profiler
+    except ImportError:
+        ...
+    else:
+        line_profiler.profile._kernprof_overwrite(prof)
+
     if options.builtin:
         builtins.__dict__['profile'] = prof
 
@@ -260,7 +373,11 @@ def main(args=None):
         try:
             execfile_ = execfile
             ns = locals()
-            if options.builtin:
+            if options.prof_mod and options.line_by_line:
+                from line_profiler.autoprofile import autoprofile
+                prof_mod = options.prof_mod.split(',')
+                autoprofile.run(script_file, ns, prof_mod=prof_mod, profile_imports=options.prof_imports)
+            elif options.builtin:
                 execfile(__file__, ns, ns)
             else:
                 prof.runctx('execfile_(%r, globals())' % (script_file,), ns, ns)
@@ -273,11 +390,19 @@ def main(args=None):
         print('Wrote profile results to %s' % options.outfile)
         if options.view:
             if isinstance(prof, ContextualProfile):
-                prof.print_stats(stream=original_stdout)
+                prof.print_stats()
             else:
                 prof.print_stats(output_unit=options.unit,
                                  stripzeros=options.skip_zero,
+                                 rich=options.rich,
                                  stream=original_stdout)
+        else:
+            print('Inspect results with:')
+            py_exe = _python_command()
+            if isinstance(prof, ContextualProfile):
+                print(f'{py_exe} -m pstats "{options.outfile}"')
+            else:
+                print(f'{py_exe} -m line_profiler -rmt "{options.outfile}"')
 
 
 if __name__ == '__main__':

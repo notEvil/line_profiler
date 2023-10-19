@@ -54,6 +54,14 @@ description = "Line-by-line profiler"
 url = "https://github.com/pyutils/line_profiler"
 license = "BSD"
 dev_status = "stable"
+typed = true
+
+[tool.xcookie.entry_points]
+# the console_scripts entry point creates the xdoctest executable
+console_scripts = [
+    "kernprof=kernprof:main",
+]
+
 
 [tool.pytest.ini_options]
 addopts = "--ignore-glob=setup.py --ignore-glob=dev"
