@@ -184,7 +184,7 @@ def _statements(
                     f"\n {_NO_WORK}" if newline else f" {_NO_WORK}"
                     for newline, _ in tuples
                 )
-                string = ",".join(_v_)
+                string = ",".join(_v_).removeprefix(" ")
 
                 return f"line({string})"
 
@@ -201,6 +201,7 @@ def _statements(
                 index += 1
 
             string = "".join(strings[1:])
+
             _v_ = f"line({string})" if any(newline for newline, _ in tuples) else string
             return _v_
 

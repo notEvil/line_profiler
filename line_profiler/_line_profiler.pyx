@@ -268,7 +268,6 @@ cdef struct CBlockProfile:
 
 
 cdef struct CCallProfile:
-    int call_line
     long hit_count
     long primitive_hit_count
     PY_LONG_LONG cumulative_time
@@ -317,7 +316,7 @@ cdef class LineProfiler:
     cdef unordered_map[int64, Sub] _c_subs  # {thread id: Sub}
     cdef unordered_map[int64, unordered_map[int64, CLineProfile]] _c_line_profiles  # {thread id: {code hash: CLineProfile}}
     cdef unordered_map[int64, CBlockProfile] _c_block_profiles  # {block hash: CBlockProfile}
-    cdef unordered_map[int64, unordered_map[int64, CCallProfile]] _c_call_profiles  # {code hash: {block hash: CCallProfile}}
+    cdef unordered_map[int64, unordered_map[int64, CCallProfile]] _c_call_profiles  # {block hash: {block hash: CCallProfile}}
     cdef unordered_map[int64, unordered_map[int64, CCallStats]] _c_call_stats  # {code hash: {code hash: CCallStats}}
     cdef public list functions
     cdef public dict block_hash_map, code_hash_map, dupes_map
@@ -523,9 +522,8 @@ cdef class LineProfiler:
         call_profiles = {}
         for caller_hash, dictionary in (<dict>self._c_call_profiles).items():
             caller_profiles = call_profiles.setdefault(None if caller_hash == 0 else label(codes[caller_hash]), {})
-            for block_hash, dictionary in dictionary.items():
-                callee_profiles = caller_profiles.setdefault(None if caller_hash == 0 else dictionary["call_line"], {})
-                callee_profiles[label(codes[block_hash])] = CallProfile(dictionary["hit_count"], dictionary["primitive_hit_count"], dictionary["cumulative_time"])
+            for callee_hash, dictionary in dictionary.items():
+                caller_profiles[label(codes[callee_hash])] = CallProfile(dictionary["hit_count"], dictionary["primitive_hit_count"], dictionary["cumulative_time"])
 
         call_stats = {}
         for caller_hash, dictionary in (<dict>self._c_call_stats).items():
@@ -578,43 +576,36 @@ PyObject *arg):
         block_hash = hash(get_code_code(<PyCodeObject*>code))
         code_hash = compute_line_hash(block_hash, get_frame_lineno(py_frame))
         if self._c_line_profiles.count(code_hash):
-            # print(f'{get_frame_lineno(py_frame):3}', {PyTrace_LINE: 'line', PyTrace_CALL: 'call', PyTrace_RETURN: 'return'}.get(what, 'other'))
             ident = threading.get_ident()
             sub = &self._c_subs[ident]
 
             _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
             if what == PyTrace_CALL:
-                # push to stack
-                sub.block_hashes.push_back(sub.block_hash)
-                sub.line_numbers.push_back(sub.line_number)
-                sub.total_times.push_back(sub.total_time)
-                sub.cumulative_times.push_back(sub.cumulative_time)
-
                 if get_frame_lineno(py_frame) == code.co_firstlineno:  # function call or start generator or coroutine
                     sub.block_hit = 0
+
                 else:  # continue generator or coroutine
+                    _enter_call(sub)
                     sub.block_hash = block_hash
                     sub.line_number = get_frame_lineno(py_frame)
-                sub.total_time = 0
-                sub.cumulative_time = 0
-                sub.sub_cumulative_time = 0
 
             elif what == PyTrace_LINE:
+                if sub.block_hit == 1:
+                    _enter_call(sub)
+
                 sub.block_hash = block_hash
                 sub.line_number = get_frame_lineno(py_frame)
                 sub.line_hit = True
 
             elif what == PyTrace_RETURN:
-                call_profile = &self._c_call_profiles[compute_line_hash(sub.block_hashes.back(), sub.line_numbers.back())][block_hash]
-                if call_profile.call_line == 0:
-                    call_profile.call_line = sub.line_numbers.back()
+                call_profile = &self._c_call_profiles[sub.block_hashes.back()][block_hash]
 
                 call_profile.hit_count += 1
 
                 # primitive call
                 for index in range(sub.block_hashes.size() - 1):
-                    if sub.block_hashes[index] == sub.block_hashes.back() and sub.line_numbers[index] == sub.line_numbers.back() \
+                    if sub.block_hashes[index] == sub.block_hashes.back() \
                        and sub.block_hashes[index + 1] == block_hash:
                         break
                 else:
@@ -712,3 +703,16 @@ cdef void _record(LineProfiler self, PY_LONG_LONG time, Sub* sub):
         sub.sub_cumulative_time = 0
 
     sub.block_hit += 1
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _enter_call(Sub* sub):
+    sub.block_hashes.push_back(sub.block_hash)
+    sub.line_numbers.push_back(sub.line_number)
+    sub.total_times.push_back(sub.total_time)
+    sub.cumulative_times.push_back(sub.cumulative_time)
+
+    sub.total_time = 0
+    sub.cumulative_time = 0
+    sub.sub_cumulative_time = 0
