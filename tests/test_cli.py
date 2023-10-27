@@ -46,7 +46,7 @@ def test_cli():
     assert info['ret'] == 0
     # Check for some patterns that should be in the output
     assert '% Time' in info['out']
-    assert '7       100' in info['out']
+    assert '7     100' in info['out']
 
 
 def test_version_agreement():

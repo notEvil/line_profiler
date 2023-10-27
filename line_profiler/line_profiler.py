@@ -289,10 +289,7 @@ def show_func(filename, start_lineno, func_name, timings, unit,
         stream = sys.stdout
 
     total_hits = sum(t[1] for t in timings)
-    total_time = sum(t[2] for t in timings)
-
-    if block_profile is not None:
-        total_time = block_profile.cumulative_time
+    total_time = sum(t[2] for t in timings) if block_profile is None else block_profile.cumulative_time
 
     if stripzeros and total_hits == 0:
         return
@@ -315,7 +312,7 @@ def show_func(filename, start_lineno, func_name, timings, unit,
 
     linenos = [t[0] for t in timings]
 
-    stream.write('Total time: %g s\n' % (total_time * unit))
+    stream.write('Cumulative time: %g s\n' % (total_time * unit))
     if os.path.exists(filename) or is_ipython_kernel_cell(filename):
         stream.write(f'File: {filename}\n')
         stream.write(f'Function: {func_name} at line {start_lineno}\n')
@@ -336,26 +333,36 @@ def show_func(filename, start_lineno, func_name, timings, unit,
 
     # Define minimum column sizes so text fits and usually looks consistent
     default_column_sizes = {
-        'line': 6,
-        'hits': 9,
-        'time': 12,
+        'line': 4,
+        'hits': 7,
+        'total': 7,
+        'time': 7,
         'perhit': 8,
-        'percent': 8,
+        'percent': 7,
     }
 
     display = {}
 
     # Loop over each line to determine better column formatting.
     # Fallback to scientific notation if columns are larger than a threshold.
-    for lineno, nhits, time in timings:
+    for timing in timings:
+        if type(timing) is tuple:
+            lineno, nhits, time = timing
+            _total_time = 0
+        else:
+            lineno = timing.line_number
+            nhits = timing.hit_count
+            time = timing.cumulative_time
+            _total_time = timing.total_time
+
         if total_time == 0:  # Happens rarely on empty function
             percent = ''
         else:
-            percent = '%5.1f' % (100 * time / total_time)
+            percent = '%3.1f' % (100 * time / total_time)
 
-        time_disp = '%5.1f' % (time * scalar)
+        time_disp = '%5.0f' % (time * scalar)
         if len(time_disp) > default_column_sizes['time']:
-            time_disp = '%5.1g' % (time * scalar)
+            time_disp = '%5.0g' % (time * scalar)
 
         perhit_disp = '%5.1f' % (float(time) * scalar / nhits)
         if len(perhit_disp) > default_column_sizes['perhit']:
@@ -365,7 +372,14 @@ def show_func(filename, start_lineno, func_name, timings, unit,
         if len(nhits_disp) > default_column_sizes['hits']:
             nhits_disp = '%g' % nhits
 
-        display[lineno] = (nhits_disp, time_disp, perhit_disp, percent)
+        if _total_time == 0:
+            total_time_disp = ''
+        else:
+            total_time_disp = '%5.0f' % (_total_time * scalar)
+            if len(total_time_disp) > default_column_sizes['total']:
+                total_time_disp = '%5.0g' % (_total_time * scalar)
+
+        display[lineno] = (nhits_disp, total_time_disp, time_disp, perhit_disp, percent)
 
     # Expand column sizes if the numbers are large.
     column_sizes = default_column_sizes.copy()
@@ -377,13 +391,13 @@ def show_func(filename, start_lineno, func_name, timings, unit,
         column_sizes['time'] = max(column_sizes['time'], max_timelen)
         column_sizes['perhit'] = max(column_sizes['perhit'], max_perhitlen)
 
-    col_order = ['line', 'hits', 'time', 'perhit', 'percent']
+    col_order = ['line', 'hits', 'total', 'time', 'perhit', 'percent']
     lhs_template = ' '.join(['%' + str(column_sizes[k]) + 's' for k in col_order])
     template = lhs_template + '  %-s'
 
     linenos = range(start_lineno, start_lineno + len(sublines))
-    empty = ('', '', '', '')
-    header = ('Line #', 'Hits', 'Time', 'Per Hit', '% Time', 'Line Contents')
+    empty = ('', '', '', '', '')
+    header = ('Line', 'Hits', 'Total', 'Cumul.', 'Per Hit', '% Time', 'Line Contents')
     header = template % header
     stream.write('\n')
     stream.write(header)
@@ -434,8 +448,8 @@ def show_func(filename, start_lineno, func_name, timings, unit,
         stream.write('\n')
     else:
         for lineno, line in zip(linenos, sublines):
-            nhits, time, per_hit, percent = display.get(lineno, empty)
-            txt = template % (lineno, nhits, time, per_hit, percent,
+            nhits, _total_time, time, per_hit, percent = display.get(lineno, empty)
+            txt = template % (lineno, nhits, _total_time, time, per_hit, percent,
                               line.rstrip('\n').rstrip('\r'))
             stream.write(txt)
             stream.write('\n')
@@ -457,7 +471,12 @@ def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False,
 
     if sort:
         # Order by ascending duration
-        stats_order = sorted(stats.items(), key=lambda kv: sum(t[2] for t in kv[1]))
+        def _key(tuple):
+            if block_profiles is None:
+                return sum(t[2] for t in tuple[1])
+            block_profile = block_profiles.get(tuple[0])
+            return 0 if block_profile is None else block_profile.cumulative_time
+        stats_order = sorted(stats.items(), key=_key)
     else:
         # Default ordering
         stats_order = sorted(stats.items())
@@ -473,8 +492,13 @@ def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False,
 
     if summarize:
         # Summarize the total time for each function
-        for (fn, lineno, name), timings in stats_order:
-            total_time = sum(t[2] for t in timings) * unit
+        for key, timings in stats_order:
+            if block_profiles is None:
+                total_time = sum(t[2] for t in timings) * unit
+            else:
+                block_profile = block_profiles.get(key)
+                total_time = (0 if block_profile is None else block_profile.cumulative_time) * unit
+            fn, lineno, name = key
             line = '%6.2f seconds - %s:%s - %s\n' % (total_time, fn, lineno, name)
             stream.write(line)
 
@@ -502,9 +526,9 @@ def main():
     parser.add_argument(
         '-u',
         '--unit',
-        default='1e-6',
+        default='1e-3',
         type=positive_float,
-        help='Output unit (in seconds) in which the timing info is displayed (default: 1e-6)',
+        help='Output unit (in seconds) in which the timing info is displayed (default: 1e-3)',
     )
     parser.add_argument(
         '-z',
