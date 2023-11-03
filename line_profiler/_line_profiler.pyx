@@ -397,6 +397,7 @@ cdef class LineProfiler:
             except AttributeError as e:
                 func.__func__.__code__ = code
         block_hash = hash(code.co_code)
+        self._c_block_profiles[block_hash]
         self.block_hash_map.setdefault(code, []).append(block_hash)
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
         # See if this can be sped up by not needing to iterate over every byte
@@ -405,7 +406,6 @@ cdef class LineProfiler:
             code_hash = compute_line_hash(block_hash, PyCode_Addr2Line(<PyCodeObject*>code, offset))
             code_hashes.add(code_hash)
             self._c_line_profiles[code_hash]
-        self._c_line_profiles[compute_line_hash(block_hash, code.co_firstlineno)]  # PyTrace_CALL
         self.code_hash_map[code] = code_hashes
 
         self.functions.append(func)
@@ -571,8 +571,9 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
     cdef PY_LONG_LONG time
     cdef object code
     cdef int64 block_hash
-    cdef int64 code_hash
     cdef Sub* sub
+    cdef int line_number
+    cdef int64 code_hash
     cdef int index
     cdef CCallProfile* call_profile
     cdef CCallStats* call_stats
@@ -589,28 +590,34 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
         # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
         code = get_frame_code(py_frame)
         block_hash = hash(get_code_code(<PyCodeObject*>code))
-        code_hash = compute_line_hash(block_hash, get_frame_lineno(py_frame))
-        if self._c_line_profiles.count(code_hash):
+        if self._c_block_profiles.count(block_hash):
             ident = threading.get_ident()
             sub = &self._c_subs[ident]
+
+            line_number = get_frame_lineno(py_frame)
+            if line_number == -1:
+                # assert block_hash == sub.block_hash
+                line_number = sub.line_number
+
+            code_hash = compute_line_hash(block_hash, line_number)
 
             _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
             if what == PyTrace_CALL:
-                if get_frame_lineno(py_frame) == code.co_firstlineno:  # function call or start generator or coroutine
+                if line_number == code.co_firstlineno:  # function call or start generator or coroutine
                     sub.block_hit = 0
 
                 else:  # continue generator or coroutine
                     _enter_call(sub)
                     sub.block_hash = block_hash
-                    sub.line_number = get_frame_lineno(py_frame)
+                    sub.line_number = line_number
 
             elif what == PyTrace_LINE:
                 if sub.block_hit == 1:
                     _enter_call(sub)
 
                 sub.block_hash = block_hash
-                sub.line_number = get_frame_lineno(py_frame)
+                sub.line_number = line_number
                 sub.line_hit = True
 
             elif what == PyTrace_RETURN:
@@ -637,7 +644,7 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
                 call_stats = &self._c_call_stats[compute_line_hash(sub.block_hash, sub.line_number)][code_hash]
                 if call_stats.total_s0 == 0:
                     call_stats.call_line = sub.line_number
-                    call_stats.return_line = get_frame_lineno(py_frame)
+                    call_stats.return_line = line_number
                     call_stats.cumulative_min = sub.cumulative_time
                     call_stats.cumulative_max = sub.cumulative_time
                     call_stats.total_min = sub.total_time

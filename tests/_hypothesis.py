@@ -255,8 +255,11 @@ def _calls(draw, function_properties_list):
     call_string = f"{function_properties.name}({depth_string})"
 
     if function_properties.generator:
-        _v_ = function_properties.async_
-        return f"[_ async for _ in {call_string}]" if _v_ else f"list({call_string})"
+        return (
+            f"[line12(_) async for _ in {call_string}]"
+            if function_properties.async_
+            else f"list({call_string})"
+        )
 
     return f"await {call_string}" if function_properties.async_ else call_string
 

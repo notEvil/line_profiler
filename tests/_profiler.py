@@ -1,5 +1,7 @@
 import asyncio
+import contextvars
 import inspect
+import sys
 import types
 import typing
 
@@ -21,6 +23,11 @@ class LineProfiler:
         self._block_hit_counts = {}
         self._block_primitive_hit_counts = {}
         self._block_cumulative_times = {}
+
+        self._line12 = contextvars.ContextVar("line12")
+
+        if sys.version_info.minor < 12:
+            self.line12 = lambda _: None
 
     def profile(self, function):
         self._codes.append(function.__code__)
@@ -54,8 +61,9 @@ class LineProfiler:
 
         return _function
 
-    def line(self, object=None, *_):
-        frame = self._get_caller_frame()
+    def line(self, object=None, *_, frame=None):
+        if frame is None:
+            frame = self._get_caller_frame()
 
         if self._is_profiled(frame):
             self._add(self._line_hit_counts, frame.f_lineno, 1)
@@ -68,7 +76,15 @@ class LineProfiler:
             else:
                 self._add(self._line_primitive_hit_counts, frame.f_lineno, 1)
 
+        self._line12.set(False)
         return object
+
+    def line12(self, _):
+        if self._line12.get(False):
+            return
+
+        self.line(frame=self._get_caller_frame())
+        self._line12.set(True)
 
     async def async_work(self, _):
         await asyncio.sleep(0)

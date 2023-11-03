@@ -32,6 +32,7 @@ def test_hypothesis(code_string):
         NONE=_NONE,
         profile=line_profiler_.profile,
         line=line_profiler_.line,
+        line12=line_profiler_.line12,
         work=line_profiler_.work,
         async_work=line_profiler_.async_work,
     )
@@ -39,12 +40,15 @@ def test_hypothesis(code_string):
 
     expected = line_profiler_
 
-    for unit_seconds in (1e-3, 5e-2):
+    for unit_seconds in (1e-3, 1e-2, 1e-1):
         c_code_string = code_string
 
-        _v_ = ("async_work(", f"asyncio.sleep(0 * ")
-        _v_ = [("line", ""), _v_, ("work(", f"_sleep({unit_seconds} * ")]
-        for string, with_string in _v_:
+        for string, with_string in [
+            ("line12", ""),
+            ("line", ""),
+            ("async_work(", f"asyncio.sleep({unit_seconds} * "),
+            ("work(", f"_sleep({unit_seconds} * "),
+        ]:
             c_code_string = c_code_string.replace(string, with_string)
 
         if debug:
@@ -155,9 +159,7 @@ class _Time:
         self.unit_seconds = unit_seconds
 
     def __eq__(self, seconds):
-        if seconds == 0:
-            return self.seconds <= self.unit_seconds / 10
-        return seconds <= self.seconds and self.seconds <= seconds * 1.1
+        return seconds <= self.seconds and self.seconds <= seconds + self.unit_seconds
 
     def __repr__(self):
         return f"_Time({repr(self.seconds)}, {repr(self.unit_seconds)})"

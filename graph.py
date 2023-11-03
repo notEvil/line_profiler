@@ -32,7 +32,7 @@ def main(path: pathlib.Path, remove_contextlib: bool = True):
             block_profile.primitive_hit_count,
             sum(
                 line_profile.total_time
-                for line_profile in line_stats.line_profiles[key]
+                for line_profile in line_stats.line_profiles.get(key, [])
             ),
             block_profile.cumulative_time,
         )
