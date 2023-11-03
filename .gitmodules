@@ -1,0 +1,9 @@
+[submodule "cymem"]
+	path = cymem
+	url = https://github.com/explosion/cymem
+[submodule "parallel-hashmap"]
+	path = parallel-hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap
+[submodule "preshed"]
+	path = preshed
+	url = https://github.com/explosion/preshed

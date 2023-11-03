@@ -222,19 +222,33 @@ if __name__ == '__main__':
 
         def run_cythonize(force=False):
             return cythonize(
-                Extension(
-                    name="line_profiler._line_profiler",
-                    sources=["line_profiler/_line_profiler.pyx", "line_profiler/timers.c", "line_profiler/unset_trace.c"],
-                    language="c++",
-                    define_macros=[("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))],
-                ),
+                module_list=[
+                    Extension(
+                        name="cymem.cymem",
+                        sources=["cymem/cymem/cymem.pyx"],
+                        language="c++",
+                    ),
+                    Extension(
+                        name="preshed.maps",
+                        sources=["preshed/preshed/maps.pyx"],
+                        language="c++",
+                        # include_dirs=["cymem"],
+                    ),
+                    Extension(
+                        name="line_profiler._line_profiler",
+                        sources=["line_profiler/_line_profiler.pyx", "line_profiler/timers.c", "line_profiler/unset_trace.c"],
+                        language="c++",
+                        define_macros=[("CYTHON_TRACE", (1 if os.getenv("DEV") == "true" else 0))],
+                        include_dirs=["parallel-hashmap"],
+                    ),
+                ],
                 compiler_directives={
                     "language_level": 3,
                     "infer_types": True,
                     "legacy_implicit_noexcept": True,
                     "linetrace": (True if os.getenv("DEV") == "true" else False)
                 },
-                include_path=["line_profiler/python25.pxd"],
+                include_path=["line_profiler/python25.pxd", "cymem/", "preshed/"],
                 force=force,
                 nthreads=multiprocessing.cpu_count(),
             )

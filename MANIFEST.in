@@ -12,3 +12,7 @@ recursive-include line_profiler *.pxd
 recursive-include line_profiler *.pyd
 recursive-include line_profiler *.c
 recursive-include line_profiler *.h
+recursive-include cymem *
+recursive-include parallel-hashmap *
+recursive-include preshed *
+include parallel_hashmap.pxd
