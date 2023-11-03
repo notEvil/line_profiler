@@ -1,6 +1,18 @@
-#cython: language_level=3
-"""
+# cython: language_level=3
+# cython: infer_types=True
+# cython: legacy_implicit_noexcept=True
+# distutils: language=c++
+# distutils: include_dirs = python25.pxd
+r"""
 This is the Cython backend used in :py:mod:`line_profiler.line_profiler`.
+
+Ignore:
+    # Standalone compile instructions for developers
+    # Assuming the cwd is the repo root.
+    cythonize --annotate --inplace \
+        ./line_profiler/_line_profiler.pyx \
+        ./line_profiler/timers.c \
+        ./line_profiler/unset_trace.c
 """
 from .python25 cimport PyFrameObject, PyObject, PyStringObject
 from sys import byteorder
@@ -63,7 +75,6 @@ cdef extern from "Python.h":
       #include "pyframe.h"
     #endif
     """
-    
     ctypedef struct PyFrameObject
     ctypedef struct PyCodeObject
     ctypedef long long PY_LONG_LONG
@@ -95,6 +106,7 @@ cdef extern from "Python.h":
     cdef int PyTrace_C_EXCEPTION
     cdef int PyTrace_C_RETURN
 
+
 cdef extern from "timers.c":
     PY_LONG_LONG hpTimer()
     double hpTimerUnit()
@@ -122,7 +134,7 @@ cdef inline int64 compute_line_hash(uint64 block_hash, uint64 linenum):
     return block_hash ^ linenum
 
 def label(code):
-    """ 
+    """
     Return a (filename, first_lineno, func_name) tuple for a given code object.
 
     This is the same labelling as used by the cProfile module in Python 2.5.
@@ -158,7 +170,7 @@ cpdef _code_replace(func, co_code):
 
 # Note: this is a regular Python class to allow easy pickling.
 class LineStats(object):
-    """ 
+    """
     Object to encapsulate line-profile statistics.
 
     Attributes:
@@ -289,7 +301,7 @@ cdef struct CCallStats:
 
 
 cdef class LineProfiler:
-    """ 
+    """
     Time the execution of lines of Python code.
 
     This is the Cython base class for
@@ -430,14 +442,14 @@ cdef class LineProfiler:
 
     def enable(self):
         PyEval_SetTrace(python_trace_callback, self)
-        
+
     @property
     def c_code_map(self):
         """
         A Python view of the internal C lookup table.
         """
         return <dict>self._c_line_profiles
-        
+
     @property
     def c_last_time(self):
         """
@@ -547,10 +559,13 @@ cdef class LineProfiler:
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-cdef int python_trace_callback(object self_, PyFrameObject *py_frame, int what,
-PyObject *arg):
-    """ 
+cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
+                                      int what, PyObject *arg):
+    """
     The PyEval_SetTrace() callback.
+
+    References:
+       https://github.com/python/cpython/blob/de2a4036/Include/cpython/pystate.h#L16 
     """
     cdef LineProfiler self
     cdef PY_LONG_LONG time
