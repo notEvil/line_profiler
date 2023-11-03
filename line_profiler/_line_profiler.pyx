@@ -143,7 +143,7 @@ cdef inline uint64 get_line_id(uint64 block_id, int line_number):
     """
     # linenum doesn't need to be int64 but it's really a temporary value
     # so it doesn't matter
-    return ((block_id << LINE_BITS) | (block_id & LINE_MASK)) + line_number
+    return (block_id << LINE_BITS) | ((block_id + line_number) & LINE_MASK)
 
 cdef inline uint64 get_code_block_id(PyObject* code_bytes):
     return (<uint64>code_bytes) & BLOCK_MASK
