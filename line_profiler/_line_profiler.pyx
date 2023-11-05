@@ -131,7 +131,7 @@ cdef inline int64 compute_line_hash(uint64 block_hash, uint64 linenum):
     """
     # linenum doesn't need to be int64 but it's really a temporary value
     # so it doesn't matter
-    return block_hash ^ linenum
+    return block_hash + linenum
 
 def label(code):
     """
@@ -396,7 +396,7 @@ cdef class LineProfiler:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        block_hash = hash(code.co_code)
+        block_hash = id(code.co_code)
         self._c_block_profiles[block_hash]
         self.block_hash_map.setdefault(code, []).append(block_hash)
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
@@ -589,7 +589,7 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
         time = hpTimer()
         # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
         code = get_frame_code(py_frame)
-        block_hash = hash(get_code_code(<PyCodeObject*>code))
+        block_hash = id(get_code_code(<PyCodeObject*>code))
         if self._c_block_profiles.count(block_hash):
             ident = threading.get_ident()
             sub = &self._c_subs[ident]
@@ -598,8 +598,6 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
             if line_number == -1:
                 # assert block_hash == sub.block_hash
                 line_number = sub.line_number
-
-            code_hash = compute_line_hash(block_hash, line_number)
 
             _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
@@ -641,7 +639,7 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
                 sub.line_numbers.pop_back()
                 #
 
-                call_stats = &self._c_call_stats[compute_line_hash(sub.block_hash, sub.line_number)][code_hash]
+                call_stats = &self._c_call_stats[compute_line_hash(sub.block_hash, sub.line_number)][compute_line_hash(block_hash, line_number)]
                 if call_stats.total_s0 == 0:
                     call_stats.call_line = sub.line_number
                     call_stats.return_line = line_number
