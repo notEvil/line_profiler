@@ -396,7 +396,7 @@ cdef class LineProfiler:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        block_hash = id(code.co_code)
+        block_hash = <int64>(<PyObject*>code.co_code)
         self._c_block_profiles[block_hash]
         self.block_hash_map.setdefault(code, []).append(block_hash)
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
@@ -570,6 +570,7 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
     cdef LineProfiler self
     cdef PY_LONG_LONG time
     cdef object code
+    cdef object code_bytes
     cdef int64 block_hash
     cdef Sub* sub
     cdef int line_number
@@ -589,7 +590,8 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
         time = hpTimer()
         # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
         code = get_frame_code(py_frame)
-        block_hash = id(get_code_code(<PyCodeObject*>code))
+        code_bytes = get_code_code(<PyCodeObject*>code)
+        block_hash = <int64>(<PyObject*>code_bytes)
         if self._c_block_profiles.count(block_hash):
             ident = threading.get_ident()
             sub = &self._c_subs[ident]
