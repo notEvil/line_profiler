@@ -4,6 +4,7 @@ import colorsys
 import pathlib
 import pickle
 import re
+import typing
 
 
 def all_equal(objects):
@@ -12,7 +13,8 @@ def all_equal(objects):
     return all(object == first_object for object in objects)
 
 
-def interpolate_linear(number, first_number, second_number):
+def interpolate_linear(number, first_number, second_number, power):
+    number = number**power
     return (1 - number) * first_number + number * second_number
 
 
@@ -21,7 +23,12 @@ def get_rgb(l, r, g, b):
     return colorsys.hls_to_rgb(h, l, s)
 
 
-def main(path: pathlib.Path, remove_contextlib: bool = True):
+def main(
+    path: pathlib.Path,
+    cut: float = 0.001,
+    remove_contextlib: bool = True,
+    power: float = 0.5,
+):
     with open(path, "rb") as file:
         line_stats = pickle.load(file)
 
@@ -64,21 +71,21 @@ def main(path: pathlib.Path, remove_contextlib: bool = True):
             continue
 
         caller_key, callee_key = tuple
-
-        _v_ = _get_node(caller_key, node_ids, node_stats, line_stats, remove_contextlib)
-        caller_node = _v_
-
-        _v_ = _get_node(callee_key, node_ids, node_stats, line_stats, remove_contextlib)
-        callee_node = _v_
-        if callee_node is None:
+        caller_node = _get_node(
+            caller_key, node_ids, node_stats, line_stats, cut, remove_contextlib, power
+        )
+        callee_node = _get_node(
+            callee_key, node_ids, node_stats, line_stats, cut, remove_contextlib, power
+        )
+        if caller_node is None or callee_node is None:
             continue
 
         print(
             f"{caller_node} ->"
             f' {callee_node} [label="{_get_hit_string([call_profile.primitive_hit_count, call_profile.hit_count])} |'
             f' {_get_time_string([call_profile.cumulative_time * line_stats.unit])}"'
-            f' color="{_get_color(interpolate_linear(call_profile.cumulative_time / call_profiles[None].cumulative_time, 0.8, 0), 0.5, 0.5, 0.5)}"'
-            f" penwidth={interpolate_linear(call_profile.cumulative_time / call_profiles[None].cumulative_time, 1, 5)}]"
+            f' color="{_get_color(interpolate_linear(call_profile.cumulative_time / call_profiles[None].cumulative_time, 0.8, 0, power), 0.5, 0.5, 0.5)}"'
+            f" penwidth={interpolate_linear(call_profile.cumulative_time / call_profiles[None].cumulative_time, 1, 5, power)}]"
         )
 
     print("}")
@@ -94,7 +101,7 @@ class _NodeStats:
         self.cumulative_time = cumulative_time
 
 
-def _get_node(key, node_ids, node_stats, line_stats, remove_contextlib):
+def _get_node(key, node_ids, node_stats, line_stats, cut, remove_contextlib, power):
     node_id = node_ids.get(key)
     if node_id is not None:
         return node_id
@@ -108,9 +115,14 @@ def _get_node(key, node_ids, node_stats, line_stats, remove_contextlib):
         label = _v_
 
     else:
+        if object.cumulative_time / node_stats[None].cumulative_time < cut:
+            node_ids[key] = None
+            return
+
         path_string, line_number, name = key
         module_string = _get_module_string(path_string)
         if remove_contextlib and module_string == "contextlib.py":
+            node_ids[key] = None
             return
 
         total_time = object.total_time
@@ -123,8 +135,9 @@ def _get_node(key, node_ids, node_stats, line_stats, remove_contextlib):
     node_id = f"n{len(node_ids)}"
     label = re.sub(r'"', r"\"", label)
 
-    _v_ = interpolate_linear(total_time / node_stats[None].cumulative_time, 1, 0.40)
-    print(f'{node_id} [ label="{label}" fillcolor="{_get_color(_v_, 1, 0, 0)}" ]')
+    _v_ = total_time / node_stats[None].cumulative_time
+    _v_ = _get_color(interpolate_linear(_v_, 1, 0.4, power), 1, 0, 0)
+    print(f'{node_id} [ label="{label}" fillcolor="{_v_}" ]')
 
     node_ids[key] = node_id
     return node_id
@@ -143,25 +156,42 @@ def _get_module_string(path_string):
     return ".".join(reversed(names))
 
 
-def _get_hit_string(hits_list):
-    if all_equal(hits_list):
-        hits_list = hits_list[:1]
+def _get_hit_string(hit_counts):
+    if all_equal(hit_counts):
+        hit_counts = hit_counts[:1]
 
-    string = "/".join(map(str, hits_list))
-    return f"{string}x"
+    return " / ".join(_format_number(f"{hit_count} x") for hit_count in hit_counts)
 
 
 def _get_time_string(seconds_list):
     if all_equal(seconds_list):
         seconds_list = seconds_list[:1]
 
-    ms = all(seconds < 1 for seconds in seconds_list)
-    string = "/".join(
-        [f"{int(seconds * 1e3)}" for seconds in seconds_list]
-        if ms
-        else [f"{seconds:0.1f}" for seconds in seconds_list]
-    )
-    return f"{string}ms" if ms else f"{string}s"
+    if all(seconds < 1e-3 for seconds in seconds_list):
+        scale = 1e6
+        unit_string = "μs"
+
+    elif all(seconds < 1 for seconds in seconds_list):
+        scale = 1e3
+        unit_string = "ms"
+
+    else:
+        scale = 1
+        unit_string = "s"
+
+    return " / ".join((
+        _format_number(f"{round(seconds * scale)} {unit_string}")
+        for seconds in seconds_list
+    ))
+
+
+def _format_number(string):
+    match = typing.cast(re.Match, re.search(r"\d+", string))
+
+    _v_ = reversed(range(match.end(), match.start(), -3))
+    number_string = " ".join(string[max(0, index - 3) : index] for index in _v_)
+
+    return f"{string[: match.start()]}{number_string}{string[match.end(): ]}"
 
 
 def _get_color(number, r, g, b):

@@ -41,15 +41,6 @@ cdef extern from "frameobject.h":
         #endif
     }
 
-    inline PyObject* get_code_code(PyCodeObject* code) {
-        #if PY_VERSION_HEX < 0x030B0000
-            Py_INCREF(code->co_code);
-            return code->co_code;
-        #else
-            return (PyObject*)PyCode_GetCode(code);
-        #endif
-    }
-
     inline int get_frame_lineno(PyFrameObject* frame) {
         #if PY_VERSION_HEX < 0x030B0000
             return frame->f_lineno;
@@ -59,7 +50,6 @@ cdef extern from "frameobject.h":
     }
     """
     cdef object get_frame_code(PyFrameObject* frame)
-    cdef object get_code_code(PyCodeObject* code)
     cdef int get_frame_lineno(PyFrameObject* frame)
     ctypedef int (*Py_tracefunc)(object self, PyFrameObject *py_frame, int what, PyObject *arg)
 
@@ -115,14 +105,14 @@ cdef extern from "unset_trace.c":
     void unset_trace()
 
 cdef struct CLineProfile:
-    int64 code
+    uint64 code
     int line_number
     long hit_count
     long primitive_hit_count
     PY_LONG_LONG total_time
     PY_LONG_LONG cumulative_time
 
-cdef inline int64 compute_line_hash(uint64 block_hash, uint64 linenum):
+cdef inline uint64 compute_line_hash(uint64 block_hash, uint64 linenum):
     """
     Compute the hash used to store each line timing in an unordered_map.
     This is fairly simple, and could use some improvement since linenum
@@ -260,8 +250,8 @@ class TimeStats:
 
 cdef struct Sub:
     PY_LONG_LONG time
-    int64 block_hash
-    vector[int64] block_hashes
+    uint64 block_hash
+    vector[uint64] block_hashes
     int line_number
     vector[int] line_numbers
     bint line_hit
@@ -325,11 +315,11 @@ cdef class LineProfiler:
         >>> # Print stats
         >>> self.print_stats()
     """
-    cdef unordered_map[int64, Sub] _c_subs  # {thread id: Sub}
-    cdef unordered_map[int64, unordered_map[int64, CLineProfile]] _c_line_profiles  # {thread id: {code hash: CLineProfile}}
-    cdef unordered_map[int64, CBlockProfile] _c_block_profiles  # {block hash: CBlockProfile}
-    cdef unordered_map[int64, unordered_map[int64, CCallProfile]] _c_call_profiles  # {block hash: {block hash: CCallProfile}}
-    cdef unordered_map[int64, unordered_map[int64, CCallStats]] _c_call_stats  # {code hash: {code hash: CCallStats}}
+    cdef unordered_map[uint64, Sub] _c_subs  # {thread id: Sub}
+    cdef unordered_map[uint64, unordered_map[uint64, CLineProfile]] _c_line_profiles  # {code hash: {line number: CLineProfile}}
+    cdef unordered_map[uint64, CBlockProfile] _c_block_profiles  # {block hash: CBlockProfile}
+    cdef unordered_map[uint64, unordered_map[uint64, CCallProfile]] _c_call_profiles  # {block hash: {block hash: CCallProfile}}
+    cdef unordered_map[uint64, unordered_map[uint64, CCallStats]] _c_call_stats  # {code hash: {code hash: CCallStats}}
     cdef public list functions
     cdef public dict block_hash_map, code_hash_map, dupes_map
     cdef public double timer_unit
@@ -396,7 +386,7 @@ cdef class LineProfiler:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        block_hash = <int64>(<PyObject*>code.co_code)
+        block_hash = <uint64>(<PyObject*>code)
         self._c_block_profiles[block_hash]
         self.block_hash_map.setdefault(code, []).append(block_hash)
         # TODO: Since each line can be many bytecodes, this is kinda inefficient
@@ -570,11 +560,9 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
     cdef LineProfiler self
     cdef PY_LONG_LONG time
     cdef object code
-    cdef object code_bytes
-    cdef int64 block_hash
+    cdef uint64 block_hash
     cdef Sub* sub
     cdef int line_number
-    cdef int64 code_hash
     cdef int index
     cdef CCallProfile* call_profile
     cdef CCallStats* call_stats
@@ -582,26 +570,23 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
     self = <LineProfiler>self_
 
     if what == PyTrace_LINE or what == PyTrace_CALL or what == PyTrace_RETURN:
-        """
-        - sequence: CALL -> (?P<sub>(LINE | (CALL -> (?P=sub)* -> RETURN)) -> )* -> RETURN
-          - `yield from` creates CALL -> CALL -> ... -> RETURN -> RETURN
-          - multiple calls on a single line create CALL -> ... -> RETURN -> CALL -> ... -> RETURN
-        """
+        # sequence: CALL -> (?P<sub>(LINE | (CALL -> (?&sub)* RETURN)) -> )* RETURN
+        # - `yield from` creates CALL -> CALL -> ... -> RETURN -> RETURN
+        # - multiple calls on a single line create CALL -> ... -> RETURN -> CALL -> ... -> RETURN
         time = hpTimer()
         # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
         code = get_frame_code(py_frame)
-        code_bytes = get_code_code(<PyCodeObject*>code)
-        block_hash = <int64>(<PyObject*>code_bytes)
+        block_hash = <uint64>(<PyObject*>code)
         if self._c_block_profiles.count(block_hash):
             ident = threading.get_ident()
             sub = &self._c_subs[ident]
+
+            _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
             line_number = get_frame_lineno(py_frame)
             if line_number == -1:
                 # assert block_hash == sub.block_hash
                 line_number = sub.line_number
-
-            _record(self, time, sub)  # count hit and attribute time to the previous line/block
 
             if what == PyTrace_CALL:
                 if line_number == code.co_firstlineno:  # function call or start generator or coroutine
@@ -677,7 +662,7 @@ cdef extern int python_trace_callback(object self_, PyFrameObject *py_frame,
 @cython.boundscheck(False)
 @cython.wraparound(False)
 cdef void _record(LineProfiler self, PY_LONG_LONG time, Sub* sub):
-    cdef int64 code_hash
+    cdef uint64 code_hash
     cdef CLineProfile* line_profile
     cdef CBlockProfile* block_profile
     cdef int index
