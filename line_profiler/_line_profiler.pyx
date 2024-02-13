@@ -44,15 +44,6 @@ cdef extern from "frameobject.h":
         #endif
     }
 
-    inline PyObject* get_code_code(PyCodeObject* code) {
-        #if PY_VERSION_HEX < 0x030B0000
-            Py_INCREF(code->co_code);
-            return code->co_code;
-        #else
-            return (PyObject*)PyCode_GetCode(code);
-        #endif
-    }
-
     inline int get_frame_lineno(PyFrameObject* frame) {
         #if PY_VERSION_HEX < 0x030B0000
             return frame->f_lineno;
@@ -62,7 +53,6 @@ cdef extern from "frameobject.h":
     }
     """
     cdef object get_frame_code(PyFrameObject* frame)
-    cdef object get_code_code(PyCodeObject* code)
     cdef int get_frame_lineno(PyFrameObject* frame)
     ctypedef int (*Py_tracefunc)(object self, PyFrameObject *py_frame, int what, PyObject *arg)
 
@@ -145,8 +135,8 @@ cdef inline uint64 get_line_id(uint64 block_id, int line_number):
     # so it doesn't matter
     return (block_id << LINE_BITS) | ((block_id + line_number) & LINE_MASK)
 
-cdef inline uint64 get_code_block_id(PyObject* code_bytes):
-    return (<uint64>code_bytes) & BLOCK_MASK
+cdef inline uint64 get_code_block_id(PyObject* code):
+    return (<uint64>code) & BLOCK_MASK
     # return hash(<object>code_bytes) & BLOCK_MASK
 
 cdef inline uint64 get_line_block_id(uint64 line_id):
@@ -346,7 +336,7 @@ cdef class LineProfiler:
         >>> # Print stats
         >>> self.print_stats()
     """
-    cdef parallel_flat_hash_map[int64, Sub] _c_subs  # {thread id: Sub}
+    cdef parallel_flat_hash_map[uint64, Sub] _c_subs  # {thread id: Sub}
     cdef parallel_flat_hash_map[uint64, CLineProfile] _c_line_profiles  # {line id: CLineProfile}
     cdef parallel_flat_hash_map[uint64, CBlockProfile] _c_block_profiles  # {block id: CBlockProfile}
     cdef parallel_flat_hash_map[uint64, flat_hash_map[uint64, CCallProfile]] _c_call_profiles  # {call block id: {return block id: CCallProfile}}
@@ -419,8 +409,7 @@ cdef class LineProfiler:
                 func.__code__ = code
             except AttributeError as e:
                 func.__func__.__code__ = code
-        code_bytes = get_code_code(<PyCodeObject*>code)
-        block_id = get_code_block_id(<PyObject*>code_bytes)
+        block_id = get_code_block_id(<PyObject*>code)
         self._c_block_profiles[block_id]
         self.block_map[block_id] = code
         self.presh_map.set(block_id, <void*>1)
@@ -561,9 +550,8 @@ PyObject *arg):
     cdef LineProfiler self
     cdef PY_LONG_LONG time
     cdef object code
-    cdef object code_bytes
     cdef uint64 block_id
-    cdef int64 thread_id
+    cdef uint64 thread_id
     cdef Sub* sub
     cdef int line_number
     cdef CCallProfile* call_profile
@@ -574,24 +562,21 @@ PyObject *arg):
     self = <LineProfiler>self_
 
     if what == PyTrace_LINE or what == PyTrace_CALL or what == PyTrace_RETURN:
-        """
-        - sequence: CALL -> (?P<sub>(LINE | (CALL -> (?P=sub)* -> RETURN)) -> )* -> RETURN
-          - `yield from` creates CALL -> CALL -> ... -> RETURN -> RETURN
-          - multiple calls on a single line create CALL -> ... -> RETURN -> CALL -> ... -> RETURN
-        """
+        # sequence: CALL -> (?P<sub>(LINE | (CALL -> (?&sub)* RETURN)) -> )* RETURN
+        # - `yield from` creates CALL -> CALL -> ... -> RETURN -> RETURN
+        # - multiple calls on a single line create CALL -> ... -> RETURN -> CALL -> ... -> RETURN
         if not inner_time:
             time = hpTimer()
         # Normally we'd need to DECREF the return from get_frame_code and get_code_code, but Cython does that for us
         code = get_frame_code(py_frame)
-        code_bytes = get_code_code(<PyCodeObject*>code)
-        block_id = get_code_block_id(<PyObject*>code_bytes)
+        block_id = get_code_block_id(<PyObject*>code)
         if self.presh_map.get(block_id) if True else self._c_block_profiles.count(block_id):
             if inner_time:
                 time = hpTimer()
 
             if True:
                 PyThread_tss_create(&tss_key)
-                thread_id = <int64>PyThread_tss_get(&tss_key)
+                thread_id = <uint64>PyThread_tss_get(&tss_key)
                 if thread_id == 0:
                     thread_id = threading.get_ident()
                     PyThread_tss_set(&tss_key, <void*>thread_id)

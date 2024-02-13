@@ -24,3 +24,6 @@ index.html
 tests/coverage.xml
 tests/htmlcov
 wheelhouse
+
+**/venv/**
+**/.**
