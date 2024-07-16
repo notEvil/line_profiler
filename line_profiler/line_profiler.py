@@ -22,7 +22,7 @@ except ImportError as ex:
     )
 
 # NOTE: This needs to be in sync with ../kernprof.py and __init__.py
-__version__ = '4.1.2'
+__version__ = '4.1.3'
 
 
 def load_ipython_extension(ip):
@@ -221,10 +221,12 @@ class LineProfiler(CLineProfiler):
 def is_ipython_kernel_cell(filename):
     """ Return True if a filename corresponds to a Jupyter Notebook cell
     """
+    filename = os.path.normcase(filename)
+    temp_dir = os.path.normcase(tempfile.gettempdir())
     return (
         filename.startswith('<ipython-input-') or
-        filename.startswith(os.path.join(tempfile.gettempdir(), 'ipykernel_')) or
-        filename.startswith(os.path.join(tempfile.gettempdir(), 'xpython_'))
+        filename.startswith(os.path.join(temp_dir, 'ipykernel_')) or
+        filename.startswith(os.path.join(temp_dir, 'xpython_'))
     )
 
 
@@ -498,9 +500,10 @@ def show_text(stats, unit, output_unit=None, stream=None, stripzeros=False,
             else:
                 block_profile = block_profiles.get(key)
                 total_time = (0 if block_profile is None else block_profile.cumulative_time) * unit
-            fn, lineno, name = key
-            line = '%6.2f seconds - %s:%s - %s\n' % (total_time, fn, lineno, name)
-            stream.write(line)
+            if not stripzeros or total_time:
+                fn, lineno, name = key
+                line = '%6.2f seconds - %s:%s - %s\n' % (total_time, fn, lineno, name)
+                stream.write(line)
 
 
 def load_stats(filename):
